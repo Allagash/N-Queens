@@ -94,35 +94,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#ifndef WIN32
+#include <pthread.h>
+#include <unistd.h>
+#endif
 
-/* 
+/*
    Notes on MAX_BOARDSIZE:
 
-   A 32 bit unsigned long is sufficient to hold the results for an 18 x 18
-   board (666090624 solutions) but not for a 19 x 19 board (4968057848 solutions).
-   
-   In Win32, I use a 64 bit variable to hold the results, and merely set the
-   MAX_BOARDSIZE to 21 because that's the largest board for which I've 
-   calculated a result.
-
-   Note: a 20x20 board will take over 20 hours to run on a Pentium III 800MHz,
-   while a 21x21 board will take over a week to run on the same PC. 
-
-   On Unix, you could probably change the type of g_numsolutions from unsigned long
-   to unsigned long long, or change the code to use two 32 bit ints to store the
-   results for board sizes 19 x 19 and up.
+   This implementation uses 64-bit bitmasks and a 64-bit solution counter.
+   MAX_BOARDSIZE is set to 27 so board sizes above 18 are supported while
+   keeping the counter within practical 64-bit bounds for known counts.
 */
 
 #ifdef WIN32
-
-#define MAX_BOARDSIZE 21
+#define MAX_BOARDSIZE 27
 typedef unsigned __int64 SOLUTIONTYPE;
-
+typedef unsigned __int64 BITFIELDTYPE;
+#define SOLUTION_PRINTF "%I64u"
 #else
-
-#define MAX_BOARDSIZE 18
-typedef unsigned long SOLUTIONTYPE;
-
+#define MAX_BOARDSIZE 27
+typedef unsigned long long SOLUTIONTYPE;
+typedef unsigned long long BITFIELDTYPE;
+#define SOLUTION_PRINTF "%llu"
 #endif
 
 #define MIN_BOARDSIZE 2
@@ -132,22 +126,19 @@ SOLUTIONTYPE g_numsolutions = 0;
 
 /* Print a chess table with queens positioned for a solution */
 /* This is not a critical path function & I didn't try to optimize it. */
-void printtable(int boardsize, int* aQueenBitRes, SOLUTIONTYPE numSolution)
+void printtable(int boardsize, BITFIELDTYPE* aQueenBitRes, SOLUTIONTYPE numSolution)
 {
-    int i, j, k, row;
+    int i, j, k;
+    BITFIELDTYPE row;
 
     /*  We only calculated half the solutions, because we can derive
         the other half by reflecting the solution across the "Y axis". */
     for (k = 0; k < 2; ++k)
     {
-#ifdef WIN32
-            printf("*** Solution #: %I64d ***\n", 2 * numSolution + k - 1);
-#else
-            printf("*** Solution #: %d ***\n", 2 * numSolution + k - 1);
-#endif
+            printf("*** Solution #: " SOLUTION_PRINTF " ***\n", 2 * numSolution + k - 1);
         for ( i = 0; i < boardsize; i++)
         {
-            unsigned int bitf;
+            BITFIELDTYPE bitf;
             /*
                Get the column that was set (i.e. find the
                first, least significant, bit set).
@@ -165,7 +156,7 @@ void printtable(int boardsize, int* aQueenBitRes, SOLUTIONTYPE numSolution)
                 {
                     printf("Q ");
                 }
-                else if (1 == k && (row & (1 << (boardsize - j - 1)))) /* this is the board reflected across the "Y axis" */
+                else if (1 == k && (row & (((BITFIELDTYPE)1) << (boardsize - j - 1)))) /* this is the board reflected across the "Y axis" */
                 {
                     printf("Q ");
                 }
@@ -180,6 +171,123 @@ void printtable(int boardsize, int* aQueenBitRes, SOLUTIONTYPE numSolution)
     }
 }
 
+typedef struct
+{
+    int start_numrows;
+    BITFIELDTYPE col;
+    BITFIELDTYPE pos_diag;
+    BITFIELDTYPE neg_diag;
+    BITFIELDTYPE bitfield;
+} NqueenTask;
+
+#ifndef WIN32
+typedef struct
+{
+    const NqueenTask* tasks;
+    int task_count;
+    int thread_id;
+    int thread_count;
+    int board_minus;
+    BITFIELDTYPE mask;
+    SOLUTIONTYPE subtotal;
+    int started;
+} WorkerContext;
+#endif
+
+static SOLUTIONTYPE solveTask(int board_minus, BITFIELDTYPE mask, const NqueenTask* task)
+{
+    BITFIELDTYPE aQueenBitCol[MAX_BOARDSIZE];
+    BITFIELDTYPE aQueenBitPosDiag[MAX_BOARDSIZE];
+    BITFIELDTYPE aQueenBitNegDiag[MAX_BOARDSIZE];
+    BITFIELDTYPE aStack[MAX_BOARDSIZE + 2];
+    BITFIELDTYPE bitfield;
+    BITFIELDTYPE lsb;
+    int numrows;
+    BITFIELDTYPE* pnStack;
+    SOLUTIONTYPE solutions = 0;
+
+    aStack[0] = 0; /* stack sentinel */
+    pnStack = aStack + 1;
+
+    numrows = task->start_numrows;
+    bitfield = task->bitfield;
+    aQueenBitCol[numrows] = task->col;
+    aQueenBitPosDiag[numrows] = task->pos_diag;
+    aQueenBitNegDiag[numrows] = task->neg_diag;
+
+    for (;;)
+    {
+        if (0 == bitfield)
+        {
+            bitfield = *--pnStack;
+            if (pnStack == aStack)
+            {
+                break;
+            }
+            --numrows;
+            continue;
+        }
+
+        /* get least-significant set bit */
+        lsb = bitfield & (~bitfield + 1);
+        bitfield &= ~lsb;
+
+        if (numrows < board_minus)
+        {
+            int n = numrows++;
+            aQueenBitCol[numrows] = aQueenBitCol[n] | lsb;
+            aQueenBitNegDiag[numrows] = (aQueenBitNegDiag[n] | lsb) >> 1;
+            aQueenBitPosDiag[numrows] = (aQueenBitPosDiag[n] | lsb) << 1;
+            *pnStack++ = bitfield;
+            bitfield = mask & ~(aQueenBitCol[numrows] | aQueenBitNegDiag[numrows] | aQueenBitPosDiag[numrows]);
+            continue;
+        }
+
+        ++solutions;
+        bitfield = *--pnStack;
+        --numrows;
+    }
+
+    return solutions;
+}
+
+#ifndef WIN32
+static int getThreadCount(int task_count)
+{
+    long cores;
+
+    if (task_count <= 1)
+    {
+        return 1;
+    }
+
+    cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cores < 1)
+    {
+        cores = 1;
+    }
+    if (cores > task_count)
+    {
+        cores = task_count;
+    }
+    return (int)cores;
+}
+
+static void* NqueenWorker(void* arg)
+{
+    WorkerContext* context = (WorkerContext*)arg;
+    int i;
+    SOLUTIONTYPE subtotal = 0;
+
+    for (i = context->thread_id; i < context->task_count; i += context->thread_count)
+    {
+        subtotal += solveTask(context->board_minus, context->mask, &context->tasks[i]);
+    }
+
+    context->subtotal = subtotal;
+    return NULL;
+}
+#endif
 
 /* The function which calculates the N queen solutions.
    We calculate one-half the solutions, then flip the results over
@@ -202,123 +310,120 @@ void printtable(int boardsize, int* aQueenBitRes, SOLUTIONTYPE numSolution)
 */
 void Nqueen(int board_size)
 {
-    int aQueenBitRes[MAX_BOARDSIZE]; /* results */
-    int aQueenBitCol[MAX_BOARDSIZE]; /* marks colummns which already have queens */
-    int aQueenBitPosDiag[MAX_BOARDSIZE]; /* marks "positive diagonals" which already have queens */
-    int aQueenBitNegDiag[MAX_BOARDSIZE]; /* marks "negative diagonals" which already have queens */
-    int aStack[MAX_BOARDSIZE + 2]; /* we use a stack instead of recursion */
-    register int* pnStack;
-
-
-    register int numrows = 0; /* numrows redundant - could use stack */
-    register unsigned int lsb; /* least significant bit */
-    register unsigned int bitfield; /* bits which are set mark possible positions for a queen */
+    NqueenTask tasks[MAX_BOARDSIZE];
+    int task_count = 0;
+    BITFIELDTYPE bitfield;
+    BITFIELDTYPE lsb;
     int i;
     int odd = board_size & 1; /* 0 if board_size even, 1 if odd */
+    int half = board_size >> 1;
     int board_minus = board_size - 1; /* board size - 1 */
-    int mask = (1 << board_size) - 1; /* if board size is N, mask consists of N 1's */
+    BITFIELDTYPE mask = (((BITFIELDTYPE)1) << board_size) - 1; /* if board size is N, mask consists of N 1's */
+    SOLUTIONTYPE total = 0;
 
-
-    /* Initialize stack */
-    aStack[0] = -1; /* set sentinel -- signifies end of stack */
-
-    /* NOTE: (board_size & 1) is true iff board_size is odd */
-    /* We need to loop through 2x if board_size is odd */
-    for (i = 0; i < (1 + odd); ++i)
+    /* Build independent tasks for top-row placements (half board due symmetry). */
+    bitfield = (((BITFIELDTYPE)1) << half) - 1;
+    while (bitfield != 0)
     {
-        /* We don't have to optimize this part; it ain't the 
-           critical loop */
-        bitfield = 0;
-        if (0 == i)
+        NqueenTask* task = &tasks[task_count];
+
+        lsb = bitfield & (~bitfield + 1);
+        bitfield &= ~lsb;
+
+        task->start_numrows = 1;
+        task->col = lsb;
+        task->neg_diag = (lsb >> 1);
+        task->pos_diag = (lsb << 1);
+        task->bitfield = mask & ~(task->col | task->neg_diag | task->pos_diag);
+        ++task_count;
+    }
+
+    /* Odd board sizes need a second pass: first queen fixed at center column. */
+    if (odd)
+    {
+        BITFIELDTYPE middle = ((BITFIELDTYPE)1) << half;
+        bitfield = (middle - 1) >> 1;
+
+        while (bitfield != 0)
         {
-            /* Handle half of the board, except the middle
-               column. So if the board is 5 x 5, the first
-               row will be: 00011, since we're not worrying
-               about placing a queen in the center column (yet).
-            */
-            int half = board_size>>1; /* divide by two */
-            /* fill in rightmost 1's in bitfield for half of board_size
-               If board_size is 7, half of that is 3 (we're discarding the remainder)
-               and bitfield will be set to 111 in binary. */
-            bitfield = (1 << half) - 1;
-            pnStack = aStack + 1; /* stack pointer */
-    
-            aQueenBitRes[0] = 0;
-            aQueenBitCol[0] = aQueenBitPosDiag[0] = aQueenBitNegDiag[0] = 0;
-        }
-        else
-        {
-            /* Handle the middle column (of a odd-sized board).
-               Set middle column bit to 1, then set
-               half of next row.
-               So we're processing first row (one element) & half of next.
-               So if the board is 5 x 5, the first row will be: 00100, and
-               the next row will be 00011.
-            */
-            bitfield = 1 << (board_size >> 1);
-            numrows = 1; /* prob. already 0 */
+            BITFIELDTYPE col;
+            BITFIELDTYPE neg_diag;
+            BITFIELDTYPE pos_diag;
+            NqueenTask* task = &tasks[task_count];
 
-            /* The first row just has one queen (in the middle column).*/
-            aQueenBitRes[0] = bitfield;
-            aQueenBitCol[0] = aQueenBitPosDiag[0] = aQueenBitNegDiag[0] = 0;
-            aQueenBitCol[1] = bitfield;
+            lsb = bitfield & (~bitfield + 1);
+            bitfield &= ~lsb;
 
-            /* Now do the next row.  Only set bits in half of it, because we'll
-               flip the results over the "Y-axis".  */
-            aQueenBitNegDiag[1] = (bitfield >> 1);
-            aQueenBitPosDiag[1] = (bitfield << 1);
-            pnStack = aStack + 1; /* stack pointer */
-            *pnStack++ = 0; /* we're done w/ this row -- only 1 element & we've done it */
-            bitfield = (bitfield - 1) >> 1; /* bitfield -1 is all 1's to the left of the single 1 */
-        }
+            col = middle | lsb;
+            neg_diag = ((middle >> 1) | lsb) >> 1;
+            pos_diag = ((middle << 1) | lsb) << 1;
 
-        /* this is the critical loop */
-        for (;;)
-        {
-            /* could use 
-               lsb = bitfield ^ (bitfield & (bitfield -1)); 
-               to get first (least sig) "1" bit, but that's slower. */
-            lsb = -((signed)bitfield) & bitfield; /* this assumes a 2's complement architecture */
-            if (0 == bitfield) 
-            {
-                bitfield = *--pnStack; /* get prev. bitfield from stack */
-                if (pnStack == aStack) { /* if sentinel hit.... */
-                    break ;
-                }
-                --numrows;
-                continue;
-            }
-            bitfield &= ~lsb; /* toggle off this bit so we don't try it again */
-
-            aQueenBitRes[numrows] = lsb; /* save the result */
-            if (numrows < board_minus) /* we still have more rows to process? */
-            {
-                int n = numrows++;
-                aQueenBitCol[numrows] = aQueenBitCol[n] | lsb;
-                aQueenBitNegDiag[numrows] = (aQueenBitNegDiag[n] | lsb) >> 1;
-                aQueenBitPosDiag[numrows] = (aQueenBitPosDiag[n] | lsb) << 1;
-                *pnStack++ = bitfield;
-                /* We can't consider positions for the queen which are in the same
-                   column, same positive diagonal, or same negative diagonal as another
-                   queen already on the board. */
-                bitfield = mask & ~(aQueenBitCol[numrows] | aQueenBitNegDiag[numrows] | aQueenBitPosDiag[numrows]);
-                continue;
-            }
-            else
-            {
-                /* We have no more rows to process; we found a solution. */
-                /* Comment out the call to printtable in order to print the solutions as board position*/
-                /* printtable(board_size, aQueenBitRes, g_numsolutions + 1);  */
-                ++g_numsolutions;
-                bitfield = *--pnStack;
-                --numrows;
-                continue;
-            }
+            task->start_numrows = 2;
+            task->col = col;
+            task->neg_diag = neg_diag;
+            task->pos_diag = pos_diag;
+            task->bitfield = mask & ~(col | neg_diag | pos_diag);
+            ++task_count;
         }
     }
 
+#ifndef WIN32
+    {
+        int thread_count = getThreadCount(task_count);
+
+        if (thread_count > 1)
+        {
+            pthread_t threads[MAX_BOARDSIZE];
+            WorkerContext contexts[MAX_BOARDSIZE];
+
+            for (i = 0; i < thread_count; ++i)
+            {
+                contexts[i].tasks = tasks;
+                contexts[i].task_count = task_count;
+                contexts[i].thread_id = i;
+                contexts[i].thread_count = thread_count;
+                contexts[i].board_minus = board_minus;
+                contexts[i].mask = mask;
+                contexts[i].subtotal = 0;
+                contexts[i].started = 0;
+
+                if (0 == pthread_create(&threads[i], NULL, NqueenWorker, &contexts[i]))
+                {
+                    contexts[i].started = 1;
+                }
+                else
+                {
+                    /* If we can't create this thread, run its slice inline. */
+                    NqueenWorker(&contexts[i]);
+                }
+            }
+
+            for (i = 0; i < thread_count; ++i)
+            {
+                if (contexts[i].started)
+                {
+                    pthread_join(threads[i], NULL);
+                }
+                total += contexts[i].subtotal;
+            }
+        }
+        else
+        {
+            for (i = 0; i < task_count; ++i)
+            {
+                total += solveTask(board_minus, mask, &tasks[i]);
+            }
+        }
+    }
+#else
+    for (i = 0; i < task_count; ++i)
+    {
+        total += solveTask(board_minus, mask, &tasks[i]);
+    }
+#endif
+
     /* multiply solutions by two, to count mirror images */
-    g_numsolutions *= 2;
+    g_numsolutions = total * 2;
 }
 
 /* Print the results at the end of the run */
@@ -389,11 +494,7 @@ int main(int argc, char** argv)
 
     if (g_numsolutions != 0)
     {
-#ifdef WIN32
-        printf("For board size %d, %I64d solution%s found.\n", boardsize, g_numsolutions, (g_numsolutions == 1 ? "" : "s"));
-#else
-        printf("For board size %d, %d solution%s found.\n", boardsize, g_numsolutions, (g_numsolutions == 1 ? "" : "s"));
-#endif
+        printf("For board size %d, " SOLUTION_PRINTF " solution%s found.\n", boardsize, g_numsolutions, (g_numsolutions == 1 ? "" : "s"));
     }
     else
     {
