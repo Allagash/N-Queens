@@ -93,33 +93,17 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #ifndef WIN32
 #include <pthread.h>
 #include <unistd.h>
 #endif
 
-/*
-   Notes on MAX_BOARDSIZE:
-
-   This implementation uses 64-bit bitmasks and a 64-bit solution counter.
-   MAX_BOARDSIZE is set to 27 so board sizes above 18 are supported while
-   keeping the counter within practical 64-bit bounds for known counts.
-*/
-
-#ifdef WIN32
-#define MAX_BOARDSIZE 27
-typedef unsigned __int64 SOLUTIONTYPE;
-typedef unsigned __int64 BITFIELDTYPE;
-#define SOLUTION_PRINTF "%I64u"
-#else
-#define MAX_BOARDSIZE 27
-typedef unsigned long long SOLUTIONTYPE;
-typedef unsigned long long BITFIELDTYPE;
-#define SOLUTION_PRINTF "%llu"
-#endif
+#include "nq_types.h"
 
 #define MIN_BOARDSIZE 2
+#define DEFAULT_FRONTIER_DEPTH 6
 
 SOLUTIONTYPE g_numsolutions = 0; 
 
@@ -173,12 +157,10 @@ void printtable(int boardsize, BITFIELDTYPE* aQueenBitRes, SOLUTIONTYPE numSolut
 
 typedef struct
 {
-    int start_numrows;
-    BITFIELDTYPE col;
-    BITFIELDTYPE pos_diag;
-    BITFIELDTYPE neg_diag;
-    BITFIELDTYPE bitfield;
-} NqueenTask;
+    NqueenTask* tasks;
+    int count;
+    int capacity;
+} FrontierTaskList;
 
 #ifndef WIN32
 typedef struct
@@ -194,22 +176,61 @@ typedef struct
 } WorkerContext;
 #endif
 
+#ifdef USE_CUDA
+int solveTasksGpuCuda(int board_minus,
+                      BITFIELDTYPE mask,
+                      const NqueenTask* tasks,
+                      int task_count,
+                      SOLUTIONTYPE* total_out);
+#endif
+
+static void initTaskList(FrontierTaskList* list)
+{
+    list->tasks = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static void freeTaskList(FrontierTaskList* list)
+{
+    free(list->tasks);
+    list->tasks = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static int appendTask(FrontierTaskList* list, const NqueenTask* task)
+{
+    if (list->count == list->capacity)
+    {
+        int new_capacity = (0 == list->capacity) ? 1024 : list->capacity * 2;
+        NqueenTask* new_tasks = (NqueenTask*)realloc(list->tasks, (size_t)new_capacity * sizeof(NqueenTask));
+        if (NULL == new_tasks)
+        {
+            return 0;
+        }
+        list->tasks = new_tasks;
+        list->capacity = new_capacity;
+    }
+
+    list->tasks[list->count++] = *task;
+    return 1;
+}
+
 static SOLUTIONTYPE solveTask(int board_minus, BITFIELDTYPE mask, const NqueenTask* task)
 {
     BITFIELDTYPE aQueenBitCol[MAX_BOARDSIZE];
     BITFIELDTYPE aQueenBitPosDiag[MAX_BOARDSIZE];
     BITFIELDTYPE aQueenBitNegDiag[MAX_BOARDSIZE];
-    BITFIELDTYPE aStack[MAX_BOARDSIZE + 2];
+    BITFIELDTYPE aStack[MAX_BOARDSIZE + 1];
     BITFIELDTYPE bitfield;
     BITFIELDTYPE lsb;
     int numrows;
-    BITFIELDTYPE* pnStack;
+    int stack_count;
     SOLUTIONTYPE solutions = 0;
 
-    aStack[0] = 0; /* stack sentinel */
-    pnStack = aStack + 1;
-
     numrows = task->start_numrows;
+    stack_count = 0;
     bitfield = task->bitfield;
     aQueenBitCol[numrows] = task->col;
     aQueenBitPosDiag[numrows] = task->pos_diag;
@@ -219,11 +240,11 @@ static SOLUTIONTYPE solveTask(int board_minus, BITFIELDTYPE mask, const NqueenTa
     {
         if (0 == bitfield)
         {
-            bitfield = *--pnStack;
-            if (pnStack == aStack)
+            if (0 == stack_count)
             {
                 break;
             }
+            bitfield = aStack[--stack_count];
             --numrows;
             continue;
         }
@@ -238,17 +259,198 @@ static SOLUTIONTYPE solveTask(int board_minus, BITFIELDTYPE mask, const NqueenTa
             aQueenBitCol[numrows] = aQueenBitCol[n] | lsb;
             aQueenBitNegDiag[numrows] = (aQueenBitNegDiag[n] | lsb) >> 1;
             aQueenBitPosDiag[numrows] = (aQueenBitPosDiag[n] | lsb) << 1;
-            *pnStack++ = bitfield;
+            aStack[stack_count++] = bitfield;
             bitfield = mask & ~(aQueenBitCol[numrows] | aQueenBitNegDiag[numrows] | aQueenBitPosDiag[numrows]);
             continue;
         }
 
         ++solutions;
-        bitfield = *--pnStack;
+        if (0 == stack_count)
+        {
+            break;
+        }
+        bitfield = aStack[--stack_count];
         --numrows;
     }
 
     return solutions;
+}
+
+static int getFrontierDepth(int board_size)
+{
+    const char* env = getenv("NQ_FRONTIER_DEPTH");
+    int depth = DEFAULT_FRONTIER_DEPTH;
+
+    if (env != NULL && *env != '\0')
+    {
+        char* endp = NULL;
+        long parsed = strtol(env, &endp, 10);
+        if (endp != env && parsed > 0)
+        {
+            depth = (int)parsed;
+        }
+    }
+
+    if (depth < 1)
+    {
+        depth = 1;
+    }
+    if (depth > board_size - 1)
+    {
+        depth = board_size - 1;
+    }
+
+    return depth;
+}
+
+static int generateFrontierFromSeed(int board_minus,
+                                    BITFIELDTYPE mask,
+                                    int frontier_depth,
+                                    const NqueenTask* seed,
+                                    FrontierTaskList* out)
+{
+    BITFIELDTYPE aQueenBitCol[MAX_BOARDSIZE];
+    BITFIELDTYPE aQueenBitPosDiag[MAX_BOARDSIZE];
+    BITFIELDTYPE aQueenBitNegDiag[MAX_BOARDSIZE];
+    BITFIELDTYPE aStack[MAX_BOARDSIZE + 1];
+    BITFIELDTYPE bitfield;
+    BITFIELDTYPE lsb;
+    int numrows;
+    int stack_count;
+
+    numrows = seed->start_numrows;
+    stack_count = 0;
+    bitfield = seed->bitfield;
+    aQueenBitCol[numrows] = seed->col;
+    aQueenBitPosDiag[numrows] = seed->pos_diag;
+    aQueenBitNegDiag[numrows] = seed->neg_diag;
+
+    for (;;)
+    {
+        if (numrows >= frontier_depth)
+        {
+            NqueenTask task;
+            task.start_numrows = numrows;
+            task.col = aQueenBitCol[numrows];
+            task.pos_diag = aQueenBitPosDiag[numrows];
+            task.neg_diag = aQueenBitNegDiag[numrows];
+            task.bitfield = bitfield;
+
+            if (!appendTask(out, &task))
+            {
+                return 0;
+            }
+
+            if (0 == stack_count)
+            {
+                break;
+            }
+            bitfield = aStack[--stack_count];
+            --numrows;
+            continue;
+        }
+
+        if (0 == bitfield)
+        {
+            if (0 == stack_count)
+            {
+                break;
+            }
+            bitfield = aStack[--stack_count];
+            --numrows;
+            continue;
+        }
+
+        lsb = bitfield & (~bitfield + 1);
+        bitfield &= ~lsb;
+
+        if (numrows < board_minus)
+        {
+            int n = numrows++;
+            aQueenBitCol[numrows] = aQueenBitCol[n] | lsb;
+            aQueenBitNegDiag[numrows] = (aQueenBitNegDiag[n] | lsb) >> 1;
+            aQueenBitPosDiag[numrows] = (aQueenBitPosDiag[n] | lsb) << 1;
+            aStack[stack_count++] = bitfield;
+            bitfield = mask & ~(aQueenBitCol[numrows] | aQueenBitNegDiag[numrows] | aQueenBitPosDiag[numrows]);
+            continue;
+        }
+
+        /* Leaf solution reached before frontier depth clamp. */
+        if (0 == stack_count)
+        {
+            break;
+        }
+        bitfield = aStack[--stack_count];
+        --numrows;
+    }
+
+    return 1;
+}
+
+static int generateFrontier(int board_size,
+                            int board_minus,
+                            BITFIELDTYPE mask,
+                            int frontier_depth,
+                            FrontierTaskList* out)
+{
+    int odd = board_size & 1;
+    int half = board_size >> 1;
+    BITFIELDTYPE bitfield;
+    BITFIELDTYPE lsb;
+
+    bitfield = (((BITFIELDTYPE)1) << half) - 1;
+    while (bitfield != 0)
+    {
+        NqueenTask seed;
+
+        lsb = bitfield & (~bitfield + 1);
+        bitfield &= ~lsb;
+
+        seed.start_numrows = 1;
+        seed.col = lsb;
+        seed.neg_diag = (lsb >> 1);
+        seed.pos_diag = (lsb << 1);
+        seed.bitfield = mask & ~(seed.col | seed.neg_diag | seed.pos_diag);
+
+        if (!generateFrontierFromSeed(board_minus, mask, frontier_depth, &seed, out))
+        {
+            return 0;
+        }
+    }
+
+    if (odd)
+    {
+        BITFIELDTYPE middle = ((BITFIELDTYPE)1) << half;
+        bitfield = (middle - 1) >> 1;
+
+        while (bitfield != 0)
+        {
+            BITFIELDTYPE col;
+            BITFIELDTYPE neg_diag;
+            BITFIELDTYPE pos_diag;
+            NqueenTask seed;
+
+            lsb = bitfield & (~bitfield + 1);
+            bitfield &= ~lsb;
+
+            col = middle | lsb;
+            neg_diag = ((middle >> 1) | lsb) >> 1;
+            pos_diag = ((middle << 1) | lsb) << 1;
+
+            seed.start_numrows = 2;
+            seed.col = col;
+            seed.neg_diag = neg_diag;
+            seed.pos_diag = pos_diag;
+            seed.bitfield = mask & ~(col | neg_diag | pos_diag);
+
+            if (!generateFrontierFromSeed(board_minus, mask, frontier_depth, &seed, out))
+            {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
 }
 
 #ifndef WIN32
@@ -289,6 +491,119 @@ static void* NqueenWorker(void* arg)
 }
 #endif
 
+static SOLUTIONTYPE solveTasksCpu(int board_minus,
+                                  BITFIELDTYPE mask,
+                                  const NqueenTask* tasks,
+                                  int task_count)
+{
+    int i;
+    SOLUTIONTYPE total = 0;
+
+    if (task_count <= 0)
+    {
+        return 0;
+    }
+
+#ifndef WIN32
+    {
+        int thread_count = getThreadCount(task_count);
+
+        if (thread_count > 1)
+        {
+            pthread_t* threads = (pthread_t*)malloc((size_t)thread_count * sizeof(pthread_t));
+            WorkerContext* contexts = (WorkerContext*)malloc((size_t)thread_count * sizeof(WorkerContext));
+
+            if (threads != NULL && contexts != NULL)
+            {
+                for (i = 0; i < thread_count; ++i)
+                {
+                    contexts[i].tasks = tasks;
+                    contexts[i].task_count = task_count;
+                    contexts[i].thread_id = i;
+                    contexts[i].thread_count = thread_count;
+                    contexts[i].board_minus = board_minus;
+                    contexts[i].mask = mask;
+                    contexts[i].subtotal = 0;
+                    contexts[i].started = 0;
+
+                    if (0 == pthread_create(&threads[i], NULL, NqueenWorker, &contexts[i]))
+                    {
+                        contexts[i].started = 1;
+                    }
+                    else
+                    {
+                        /* If this thread fails to start, run its share inline. */
+                        NqueenWorker(&contexts[i]);
+                    }
+                }
+
+                for (i = 0; i < thread_count; ++i)
+                {
+                    if (contexts[i].started)
+                    {
+                        pthread_join(threads[i], NULL);
+                    }
+                    total += contexts[i].subtotal;
+                }
+
+                free(contexts);
+                free(threads);
+                return total;
+            }
+
+            free(contexts);
+            free(threads);
+        }
+    }
+#endif
+
+    for (i = 0; i < task_count; ++i)
+    {
+        total += solveTask(board_minus, mask, &tasks[i]);
+    }
+
+    return total;
+}
+
+#ifdef USE_CUDA
+static int getGpuMinTasks(void)
+{
+    const char* env = getenv("NQ_GPU_MIN_TASKS");
+    int min_tasks = 4096;
+
+    if (env != NULL && *env != '\0')
+    {
+        char* endp = NULL;
+        long parsed = strtol(env, &endp, 10);
+        if (endp != env && parsed >= 1)
+        {
+            min_tasks = (int)parsed;
+        }
+    }
+
+    return min_tasks;
+}
+
+static int shouldTryGpuSolver(int task_count)
+{
+    const char* mode = getenv("NQ_SOLVER_MODE");
+
+    if (mode != NULL)
+    {
+        if (0 == strcmp(mode, "cpu"))
+        {
+            return 0;
+        }
+        if (0 == strcmp(mode, "gpu"))
+        {
+            return 1;
+        }
+    }
+
+    return task_count >= getGpuMinTasks();
+}
+#endif
+
 /* The function which calculates the N queen solutions.
    We calculate one-half the solutions, then flip the results over
    the "Y axis" of the board.  Every solution can be reflected that
@@ -310,117 +625,36 @@ static void* NqueenWorker(void* arg)
 */
 void Nqueen(int board_size)
 {
-    NqueenTask tasks[MAX_BOARDSIZE];
-    int task_count = 0;
-    BITFIELDTYPE bitfield;
-    BITFIELDTYPE lsb;
-    int i;
-    int odd = board_size & 1; /* 0 if board_size even, 1 if odd */
-    int half = board_size >> 1;
+    FrontierTaskList frontier;
+    int frontier_depth;
     int board_minus = board_size - 1; /* board size - 1 */
     BITFIELDTYPE mask = (((BITFIELDTYPE)1) << board_size) - 1; /* if board size is N, mask consists of N 1's */
-    SOLUTIONTYPE total = 0;
+    SOLUTIONTYPE total;
 
-    /* Build independent tasks for top-row placements (half board due symmetry). */
-    bitfield = (((BITFIELDTYPE)1) << half) - 1;
-    while (bitfield != 0)
+    initTaskList(&frontier);
+    frontier_depth = getFrontierDepth(board_size);
+    if (!generateFrontier(board_size, board_minus, mask, frontier_depth, &frontier))
     {
-        NqueenTask* task = &tasks[task_count];
-
-        lsb = bitfield & (~bitfield + 1);
-        bitfield &= ~lsb;
-
-        task->start_numrows = 1;
-        task->col = lsb;
-        task->neg_diag = (lsb >> 1);
-        task->pos_diag = (lsb << 1);
-        task->bitfield = mask & ~(task->col | task->neg_diag | task->pos_diag);
-        ++task_count;
+        fprintf(stderr, "Failed to allocate frontier tasks.\n");
+        freeTaskList(&frontier);
+        g_numsolutions = 0;
+        return;
     }
 
-    /* Odd board sizes need a second pass: first queen fixed at center column. */
-    if (odd)
+#ifdef USE_CUDA
+    if (shouldTryGpuSolver(frontier.count) &&
+        solveTasksGpuCuda(board_minus, mask, frontier.tasks, frontier.count, &total))
     {
-        BITFIELDTYPE middle = ((BITFIELDTYPE)1) << half;
-        bitfield = (middle - 1) >> 1;
-
-        while (bitfield != 0)
-        {
-            BITFIELDTYPE col;
-            BITFIELDTYPE neg_diag;
-            BITFIELDTYPE pos_diag;
-            NqueenTask* task = &tasks[task_count];
-
-            lsb = bitfield & (~bitfield + 1);
-            bitfield &= ~lsb;
-
-            col = middle | lsb;
-            neg_diag = ((middle >> 1) | lsb) >> 1;
-            pos_diag = ((middle << 1) | lsb) << 1;
-
-            task->start_numrows = 2;
-            task->col = col;
-            task->neg_diag = neg_diag;
-            task->pos_diag = pos_diag;
-            task->bitfield = mask & ~(col | neg_diag | pos_diag);
-            ++task_count;
-        }
+        /* GPU result produced successfully. */
     }
-
-#ifndef WIN32
+    else
     {
-        int thread_count = getThreadCount(task_count);
-
-        if (thread_count > 1)
-        {
-            pthread_t threads[MAX_BOARDSIZE];
-            WorkerContext contexts[MAX_BOARDSIZE];
-
-            for (i = 0; i < thread_count; ++i)
-            {
-                contexts[i].tasks = tasks;
-                contexts[i].task_count = task_count;
-                contexts[i].thread_id = i;
-                contexts[i].thread_count = thread_count;
-                contexts[i].board_minus = board_minus;
-                contexts[i].mask = mask;
-                contexts[i].subtotal = 0;
-                contexts[i].started = 0;
-
-                if (0 == pthread_create(&threads[i], NULL, NqueenWorker, &contexts[i]))
-                {
-                    contexts[i].started = 1;
-                }
-                else
-                {
-                    /* If we can't create this thread, run its slice inline. */
-                    NqueenWorker(&contexts[i]);
-                }
-            }
-
-            for (i = 0; i < thread_count; ++i)
-            {
-                if (contexts[i].started)
-                {
-                    pthread_join(threads[i], NULL);
-                }
-                total += contexts[i].subtotal;
-            }
-        }
-        else
-        {
-            for (i = 0; i < task_count; ++i)
-            {
-                total += solveTask(board_minus, mask, &tasks[i]);
-            }
-        }
+        total = solveTasksCpu(board_minus, mask, frontier.tasks, frontier.count);
     }
 #else
-    for (i = 0; i < task_count; ++i)
-    {
-        total += solveTask(board_minus, mask, &tasks[i]);
-    }
+    total = solveTasksCpu(board_minus, mask, frontier.tasks, frontier.count);
 #endif
+    freeTaskList(&frontier);
 
     /* multiply solutions by two, to count mirror images */
     g_numsolutions = total * 2;

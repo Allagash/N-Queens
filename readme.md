@@ -3,6 +3,20 @@ Compile with cc -O3 -Wall -Wextra -pthread nq.c -o nq
 For machine-specific, and less portable:
 cc -O3 -march=native  -Wall -Wextra -pthread nq.c -o nq
 
+CUDA build (M2 path, requires CUDA toolkit + GPU):
+nvcc -O3 -DUSE_CUDA=1 nq.c nq_cuda.cu -Xcompiler "-pthread -Wall -Wextra" -o nq
+
+Runtime mode selection with CUDA build:
+- default / auto: tries GPU, falls back to CPU
+- auto-mode GPU threshold (default 4096 tasks): `NQ_GPU_MIN_TASKS=8192 ./nq 16`
+- GPU batch size (default 500000 tasks): `NQ_GPU_BATCH_TASKS=200000 ./nq 18`
+- force CPU: `NQ_SOLVER_MODE=cpu ./nq 16`
+- force GPU attempt: `NQ_SOLVER_MODE=gpu ./nq 16`
+- enable GPU timing metrics: `NQ_GPU_TIMING=1 ./nq 16`
+
+Frontier depth tuning:
+- `NQ_FRONTIER_DEPTH=<depth> ./nq <N>`
+
 allagash98@Jeffs-MacBook-Pro-2 nqueens (main) $ ./nq 17
 N Queens program by Jeff Somers.
   allagash98@yahoo.com or jsomers@alumni.williams.edu
@@ -41,4 +55,3 @@ End:  Fri Mar  6 21:23:07 2026
 Calculations took 1583 seconds.
 Equals 26 minutes and 23 seconds.
 For board size 20, 39029188884 solutions found.
-
