@@ -8,14 +8,61 @@ nvcc -O3 -DUSE_CUDA=1 nq.c nq_cuda.cu -Xcompiler "-pthread -Wall -Wextra" -o nq
 
 Runtime mode selection with CUDA build:
 - default / auto: tries GPU, falls back to CPU
-- auto-mode GPU threshold (default 4096 tasks): `NQ_GPU_MIN_TASKS=8192 ./nq 16`
+- auto-mode GPU threshold (default 600000 tasks): `NQ_GPU_MIN_TASKS=8192 ./nq 16`
 - GPU batch size (default 500000 tasks): `NQ_GPU_BATCH_TASKS=200000 ./nq 18`
+- persistent-kernel block override (optional): `NQ_GPU_PERSIST_BLOCKS=256 ./nq 19`
+- auto persist tuning target (tasks per block, default 8192): `NQ_GPU_TARGET_TASKS_PER_BLOCK=8192 ./nq 19`
+- optional startup auto-tune of target (default off): `NQ_GPU_AUTOTUNE_TARGET=1 ./nq 19`
+- auto-tune sample tasks (default 8192; use larger values like 65536+ on larger GPUs): `NQ_GPU_AUTOTUNE_SAMPLE_TASKS=16384 ./nq 19`
+- GPU task bucketing (default off, opt-in): `NQ_GPU_BUCKET_TASKS=1 ./nq 19`
 - force CPU: `NQ_SOLVER_MODE=cpu ./nq 16`
 - force GPU attempt: `NQ_SOLVER_MODE=gpu ./nq 16`
 - enable GPU timing metrics: `NQ_GPU_TIMING=1 ./nq 16`
 
 Frontier depth tuning:
 - `NQ_FRONTIER_DEPTH=<depth> ./nq <N>`
+
+Mode benchmark harness (CPU vs GPU vs auto, CSV output):
+- `./bench_modes.sh --ns "16 17 18 19 20" --repeats 3 --gpu-batch 500000 --frontier-depth 6`
+
+./bench_modes.sh --ns "16 17 18 19 20" --repeats 3 --gpu-batch 500000 --frontier-depth 6
+
+M4
+nvcc -O3 -DUSE_CUDA=1 nq.c nq_cuda.cu -Xcompiler "-pthread -Wall -Wextra" -o nq
+baseline:
+NQ_SOLVER_MODE=gpu NQ_GPU_TIMING=1 NQ_FRONTIER_DEPTH=6 NQ_GPU_BATCH_TASKS=500000 ./nq 19
+
+Tune:
+NQ_SOLVER_MODE=gpu NQ_GPU_TIMING=1 NQ_FRONTIER_DEPTH=6 NQ_GPU_BATCH_TASKS=500000 NQ_GPU_PERSIST_BLOCKS=64 ./nq 19
+NQ_SOLVER_MODE=gpu NQ_GPU_TIMING=1 NQ_FRONTIER_DEPTH=6 NQ_GPU_BATCH_TASKS=500000 NQ_GPU_PERSIST_BLOCKS=128 ./nq 19
+NQ_SOLVER_MODE=gpu NQ_GPU_TIMING=1 NQ_FRONTIER_DEPTH=6 NQ_GPU_BATCH_TASKS=500000 NQ_GPU_PERSIST_BLOCKS=256 ./nq 19
+
+Created script: run_n19_m4_tests.sh
+
+It runs all N=19 M4 commands:
+
+baseline persistent auto blocks
+NQ_GPU_PERSIST_BLOCKS=64
+NQ_GPU_PERSIST_BLOCKS=128
+NQ_GPU_PERSIST_BLOCKS=256
+
+3/9
+On your NVIDIA box, compare with and without bucketing:
+NQ_SOLVER_MODE=gpu NQ_GPU_TIMING=1 NQ_FRONTIER_DEPTH=6 NQ_GPU_BATCH_TASKS=500000 NQ_GPU_PERSIST_BLOCKS=64 NQ_GPU_BUCKET_TASKS=1 ./nq 19
+NQ_SOLVER_MODE=gpu NQ_GPU_TIMING=1 NQ_FRONTIER_DEPTH=6 NQ_GPU_BATCH_TASKS=500000 NQ_GPU_PERSIST_BLOCKS=64 NQ_GPU_BUCKET_TASKS=0 ./nq 19
+
+to compile:
+
+cd ~/projects/cuda
+nvcc -O3 -DUSE_CUDA=1 nq.c nq_cuda.cu -Xcompiler "-pthread -Wall -Wextra" -o nq
+
+
+If you want architecture tuning for your RTX 4060 (Ada, sm_89), use:
+
+nvcc -O3 -DUSE_CUDA=1 -arch=sm_89 nq.c nq_cuda.cu -Xcompiler "-pthread -Wall -Wextra" -o nq
+
+quick sanity run
+NQ_SOLVER_MODE=gpu NQ_GPU_TIMING=1 ./nq 19
 
 allagash98@Jeffs-MacBook-Pro-2 nqueens (main) $ ./nq 17
 N Queens program by Jeff Somers.

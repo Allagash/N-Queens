@@ -104,6 +104,9 @@
 
 #define MIN_BOARDSIZE 2
 #define DEFAULT_FRONTIER_DEPTH 6
+#define TASK_BUCKET_POP_RANGE (MAX_BOARDSIZE + 1)
+#define TASK_BUCKET_DEPTH_RANGE MAX_BOARDSIZE
+#define TASK_BUCKET_COUNT (TASK_BUCKET_DEPTH_RANGE * TASK_BUCKET_POP_RANGE)
 
 SOLUTIONTYPE g_numsolutions = 0; 
 
@@ -275,6 +278,97 @@ static SOLUTIONTYPE solveTask(int board_minus, BITFIELDTYPE mask, const NqueenTa
 
     return solutions;
 }
+
+#ifdef USE_CUDA
+static int popcountBitfield(BITFIELDTYPE value)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    return (int)__builtin_popcountll((unsigned long long)value);
+#else
+    int count = 0;
+    while (value != 0)
+    {
+        value &= (value - 1);
+        ++count;
+    }
+    return count;
+#endif
+}
+
+static int getTaskBucketIndex(int board_minus, const NqueenTask* task)
+{
+    int remaining_rows = board_minus - task->start_numrows;
+    int candidate_count = popcountBitfield(task->bitfield);
+
+    if (remaining_rows < 0)
+    {
+        remaining_rows = 0;
+    }
+    if (remaining_rows >= TASK_BUCKET_DEPTH_RANGE)
+    {
+        remaining_rows = TASK_BUCKET_DEPTH_RANGE - 1;
+    }
+
+    if (candidate_count < 0)
+    {
+        candidate_count = 0;
+    }
+    if (candidate_count > MAX_BOARDSIZE)
+    {
+        candidate_count = MAX_BOARDSIZE;
+    }
+
+    return remaining_rows * TASK_BUCKET_POP_RANGE + candidate_count;
+}
+
+static int bucketFrontierTasks(FrontierTaskList* list, int board_minus)
+{
+    int bucket_counts[TASK_BUCKET_COUNT];
+    int bucket_offsets[TASK_BUCKET_COUNT];
+    int bucket_cursor[TASK_BUCKET_COUNT];
+    NqueenTask* reordered;
+    int i;
+    int offset = 0;
+
+    if (list->count <= 1)
+    {
+        return 1;
+    }
+
+    memset(bucket_counts, 0, sizeof(bucket_counts));
+
+    for (i = 0; i < list->count; ++i)
+    {
+        int bucket = getTaskBucketIndex(board_minus, &list->tasks[i]);
+        ++bucket_counts[bucket];
+    }
+
+    /* Sort into descending hardness buckets to reduce long-tail imbalance. */
+    for (i = TASK_BUCKET_COUNT - 1; i >= 0; --i)
+    {
+        bucket_offsets[i] = offset;
+        offset += bucket_counts[i];
+    }
+    memcpy(bucket_cursor, bucket_offsets, sizeof(bucket_offsets));
+
+    reordered = (NqueenTask*)malloc((size_t)list->count * sizeof(NqueenTask));
+    if (NULL == reordered)
+    {
+        return 0;
+    }
+
+    for (i = 0; i < list->count; ++i)
+    {
+        int bucket = getTaskBucketIndex(board_minus, &list->tasks[i]);
+        int position = bucket_cursor[bucket]++;
+        reordered[position] = list->tasks[i];
+    }
+
+    memcpy(list->tasks, reordered, (size_t)list->count * sizeof(NqueenTask));
+    free(reordered);
+    return 1;
+}
+#endif
 
 static int getFrontierDepth(int board_size)
 {
@@ -569,7 +663,7 @@ static SOLUTIONTYPE solveTasksCpu(int board_minus,
 static int getGpuMinTasks(void)
 {
     const char* env = getenv("NQ_GPU_MIN_TASKS");
-    int min_tasks = 4096;
+    int min_tasks = 600000;
 
     if (env != NULL && *env != '\0')
     {
@@ -601,6 +695,27 @@ static int shouldTryGpuSolver(int task_count)
     }
 
     return task_count >= getGpuMinTasks();
+}
+
+static int shouldBucketGpuTasks(void)
+{
+    const char* value = getenv("NQ_GPU_BUCKET_TASKS");
+
+    if (NULL == value || '\0' == *value)
+    {
+        return 0;
+    }
+
+    if (0 == strcmp(value, "1") ||
+        0 == strcmp(value, "true") ||
+        0 == strcmp(value, "TRUE") ||
+        0 == strcmp(value, "on") ||
+        0 == strcmp(value, "ON"))
+    {
+        return 1;
+    }
+
+    return 0;
 }
 #endif
 
@@ -642,7 +757,17 @@ void Nqueen(int board_size)
     }
 
 #ifdef USE_CUDA
-    if (shouldTryGpuSolver(frontier.count) &&
+    int try_gpu = shouldTryGpuSolver(frontier.count);
+
+    if (try_gpu && shouldBucketGpuTasks())
+    {
+        if (!bucketFrontierTasks(&frontier, board_minus))
+        {
+            fprintf(stderr, "Warning: failed to bucket GPU tasks; continuing without bucketing.\n");
+        }
+    }
+
+    if (try_gpu &&
         solveTasksGpuCuda(board_minus, mask, frontier.tasks, frontier.count, &total))
     {
         /* GPU result produced successfully. */

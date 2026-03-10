@@ -9,6 +9,8 @@
 
 #define CUDA_BLOCK_SIZE 256
 #define DEFAULT_GPU_BATCH_TASKS 500000
+#define DEFAULT_GPU_TARGET_TASKS_PER_BLOCK 8192
+#define DEFAULT_GPU_AUTOTUNE_SAMPLE_TASKS 8192
 
 static __device__ SOLUTIONTYPE solveTaskDevice(int board_minus,
                                                BITFIELDTYPE mask,
@@ -74,16 +76,22 @@ static __global__ void solveTasksKernel(int board_minus,
                                         BITFIELDTYPE mask,
                                         const NqueenTask* tasks,
                                         int task_count,
+                                        unsigned int* next_task,
                                         SOLUTIONTYPE* block_sums)
 {
     __shared__ SOLUTIONTYPE shared_sums[CUDA_BLOCK_SIZE];
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
     SOLUTIONTYPE local = 0;
 
-    if (idx < task_count)
+    for (;;)
     {
-        local = solveTaskDevice(board_minus, mask, tasks[idx]);
+        unsigned int idx = atomicAdd(next_task, 1u);
+        if (idx >= (unsigned int)task_count)
+        {
+            break;
+        }
+        local += solveTaskDevice(board_minus, mask, tasks[idx]);
     }
+
     shared_sums[threadIdx.x] = local;
     __syncthreads();
 
@@ -170,6 +178,315 @@ static int getGpuBatchTasks(void)
     return batch_tasks;
 }
 
+static int getGpuPersistentBlocks(void)
+{
+    const char* value = getenv("NQ_GPU_PERSIST_BLOCKS");
+    int blocks = 0;
+
+    if (value != NULL && *value != '\0')
+    {
+        char* endp = NULL;
+        long parsed = strtol(value, &endp, 10);
+        if (endp != value && parsed >= 1)
+        {
+            blocks = (int)parsed;
+        }
+    }
+
+    return blocks;
+}
+
+static int getGpuTargetTasksPerBlock(int* was_overridden)
+{
+    const char* value = getenv("NQ_GPU_TARGET_TASKS_PER_BLOCK");
+    int target = DEFAULT_GPU_TARGET_TASKS_PER_BLOCK;
+
+    if (was_overridden != NULL)
+    {
+        *was_overridden = 0;
+    }
+
+    if (value != NULL && *value != '\0')
+    {
+        char* endp = NULL;
+        long parsed = strtol(value, &endp, 10);
+        if (endp != value && parsed >= 1)
+        {
+            target = (int)parsed;
+            if (was_overridden != NULL)
+            {
+                *was_overridden = 1;
+            }
+        }
+    }
+
+    if (target < 1)
+    {
+        target = 1;
+    }
+    return target;
+}
+
+static int shouldAutoTuneGpuTarget(void)
+{
+    const char* value = getenv("NQ_GPU_AUTOTUNE_TARGET");
+
+    if (NULL == value || '\0' == *value)
+    {
+        return 0;
+    }
+
+    if (0 == strcmp(value, "1") ||
+        0 == strcmp(value, "true") ||
+        0 == strcmp(value, "TRUE") ||
+        0 == strcmp(value, "on") ||
+        0 == strcmp(value, "ON"))
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int getGpuAutoTuneSampleTasks(void)
+{
+    const char* value = getenv("NQ_GPU_AUTOTUNE_SAMPLE_TASKS");
+    int sample_tasks = DEFAULT_GPU_AUTOTUNE_SAMPLE_TASKS;
+
+    if (value != NULL && *value != '\0')
+    {
+        char* endp = NULL;
+        long parsed = strtol(value, &endp, 10);
+        if (endp != value && parsed >= 1)
+        {
+            sample_tasks = (int)parsed;
+        }
+    }
+
+    if (sample_tasks < 1)
+    {
+        sample_tasks = 1;
+    }
+    return sample_tasks;
+}
+
+static int getLaunchBlocksCap(int current_tasks)
+{
+    int blocks_by_cap = (current_tasks + (CUDA_BLOCK_SIZE * 8) - 1) / (CUDA_BLOCK_SIZE * 8);
+
+    if (blocks_by_cap < 1)
+    {
+        blocks_by_cap = 1;
+    }
+    return blocks_by_cap;
+}
+
+static int getPersistentLaunchBlocks(int current_tasks,
+                                     int sm_count,
+                                     int override_blocks,
+                                     int target_tasks_per_block)
+{
+    int blocks_by_cap;
+    int blocks_by_grain;
+    int min_blocks_by_sm;
+    int blocks;
+
+    if (override_blocks > 0)
+    {
+        return override_blocks;
+    }
+
+    blocks_by_cap = getLaunchBlocksCap(current_tasks);
+
+    blocks_by_grain = (current_tasks + target_tasks_per_block - 1) / target_tasks_per_block;
+    if (blocks_by_grain < 1)
+    {
+        blocks_by_grain = 1;
+    }
+
+    if (sm_count > 0)
+    {
+        min_blocks_by_sm = sm_count * 2;
+        if (min_blocks_by_sm < 1)
+        {
+            min_blocks_by_sm = 1;
+        }
+    }
+    else
+    {
+        min_blocks_by_sm = 1;
+    }
+
+    blocks = blocks_by_grain;
+    if (blocks < min_blocks_by_sm)
+    {
+        blocks = min_blocks_by_sm;
+    }
+    if (blocks > blocks_by_cap)
+    {
+        blocks = blocks_by_cap;
+    }
+    if (blocks < 1)
+    {
+        blocks = 1;
+    }
+
+    return blocks;
+}
+
+static int addUniqueCandidate(int* values, int* count, int value, int max_value)
+{
+    int i;
+
+    if (value < 1)
+    {
+        value = 1;
+    }
+    if (value > max_value)
+    {
+        value = max_value;
+    }
+
+    for (i = 0; i < *count; ++i)
+    {
+        if (values[i] == value)
+        {
+            return 1;
+        }
+    }
+
+    values[*count] = value;
+    ++(*count);
+    return 1;
+}
+
+static int shouldRunAutotuneSample(int sample_max_blocks, int baseline_blocks)
+{
+    if (sample_max_blocks < 8)
+    {
+        return 0;
+    }
+
+    if (baseline_blocks > 0 && (sample_max_blocks * 2) < baseline_blocks)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int autotuneTargetTasksPerBlock(int board_minus,
+                                       BITFIELDTYPE mask,
+                                       const NqueenTask* d_tasks,
+                                       int sample_tasks,
+                                       int sm_count,
+                                       int base_target,
+                                       int sample_max_blocks,
+                                       unsigned int* d_next_task,
+                                       SOLUTIONTYPE* d_partial_a,
+                                       int* tuned_target_out,
+                                       int* tuned_blocks_out,
+                                       float* tune_ms_total_out)
+{
+    int base_blocks;
+    int candidates[10];
+    int candidate_count = 0;
+    int best_blocks = 0;
+    float best_ms = 0.0f;
+    float total_ms = 0.0f;
+    cudaEvent_t ev_start = NULL;
+    cudaEvent_t ev_stop = NULL;
+    int had_error = 0;
+    int i;
+
+    if (sample_tasks < 1024 ||
+        sample_max_blocks < 1 ||
+        NULL == tuned_target_out ||
+        NULL == tuned_blocks_out ||
+        NULL == tune_ms_total_out)
+    {
+        return 0;
+    }
+
+    base_blocks = getPersistentLaunchBlocks(sample_tasks, sm_count, 0, base_target);
+
+    addUniqueCandidate(candidates, &candidate_count, base_blocks / 2, sample_max_blocks);
+    addUniqueCandidate(candidates, &candidate_count, (base_blocks * 3) / 4, sample_max_blocks);
+    addUniqueCandidate(candidates, &candidate_count, base_blocks, sample_max_blocks);
+    addUniqueCandidate(candidates, &candidate_count, (base_blocks * 5) / 4, sample_max_blocks);
+    addUniqueCandidate(candidates, &candidate_count, (base_blocks * 3) / 2, sample_max_blocks);
+    addUniqueCandidate(candidates, &candidate_count, base_blocks * 2, sample_max_blocks);
+    if (sm_count > 0)
+    {
+        addUniqueCandidate(candidates, &candidate_count, sm_count, sample_max_blocks);
+        addUniqueCandidate(candidates, &candidate_count, sm_count * 2, sample_max_blocks);
+        addUniqueCandidate(candidates, &candidate_count, sm_count * 3, sample_max_blocks);
+    }
+
+    if (candidate_count < 2)
+    {
+        return 0;
+    }
+
+    if (cudaSuccess != cudaEventCreate(&ev_start) ||
+        cudaSuccess != cudaEventCreate(&ev_stop))
+    {
+        if (ev_start) cudaEventDestroy(ev_start);
+        if (ev_stop) cudaEventDestroy(ev_stop);
+        return 0;
+    }
+
+    for (i = 0; i < candidate_count; ++i)
+    {
+        int launch_blocks = candidates[i];
+        float elapsed_ms = 0.0f;
+        cudaError_t err;
+
+        err = cudaMemset(d_next_task, 0, sizeof(unsigned int));
+        if (cudaSuccess != err)
+        {
+            had_error = 1;
+            break;
+        }
+
+        cudaEventRecord(ev_start, 0);
+        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE>>>(board_minus, mask, d_tasks, sample_tasks, d_next_task, d_partial_a);
+        err = cudaGetLastError();
+        if (cudaSuccess != err)
+        {
+            had_error = 1;
+            break;
+        }
+        cudaEventRecord(ev_stop, 0);
+        cudaEventSynchronize(ev_stop);
+        cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop);
+        total_ms += elapsed_ms;
+
+        if (0 == i || elapsed_ms < best_ms)
+        {
+            best_ms = elapsed_ms;
+            best_blocks = launch_blocks;
+        }
+    }
+
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
+
+    if (had_error || best_blocks < 1)
+    {
+        return 0;
+    }
+
+    *tuned_blocks_out = best_blocks;
+    *tuned_target_out = (base_target * base_blocks + best_blocks - 1) / best_blocks;
+    if (*tuned_target_out < 1)
+    {
+        *tuned_target_out = 1;
+    }
+    *tune_ms_total_out = total_ms;
+    return 1;
+}
+
 extern "C" int solveTasksGpuCuda(int board_minus,
                                  BITFIELDTYPE mask,
                                  const NqueenTask* tasks,
@@ -177,15 +494,17 @@ extern "C" int solveTasksGpuCuda(int board_minus,
                                  SOLUTIONTYPE* total_out)
 {
     int batch_capacity;
-    int max_blocks;
+    int max_launch_blocks;
     size_t task_buffer_bytes;
     size_t partial_bytes;
     NqueenTask* d_tasks = NULL;
     SOLUTIONTYPE* d_partial_a = NULL;
     SOLUTIONTYPE* d_partial_b = NULL;
+    unsigned int* d_next_task = NULL;
     SOLUTIONTYPE total = 0;
     SOLUTIONTYPE batch_total = 0;
     cudaError_t err;
+    cudaDeviceProp device_prop;
     cudaEvent_t ev_start = NULL;
     cudaEvent_t ev_stop = NULL;
     float h2d_total_ms = 0.0f;
@@ -194,9 +513,19 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     float phase_ms = 0.0f;
     int print_timing = shouldPrintGpuTiming();
     int batch_tasks = getGpuBatchTasks();
+    int persist_blocks = getGpuPersistentBlocks();
+    int target_override = 0;
+    int target_tasks_per_block = getGpuTargetTasksPerBlock(&target_override);
+    int autotune_target = shouldAutoTuneGpuTarget();
+    int autotune_sample_tasks = getGpuAutoTuneSampleTasks();
+    int autotune_applied = 0;
+    int autotune_best_blocks = 0;
+    float autotune_kernel_ms = 0.0f;
+    int sm_count = 0;
     int batches = 0;
     int total_reduction_passes = 0;
     int max_reduction_passes = 0;
+    int max_blocks_used = 0;
     int success = 0;
     int offset;
 
@@ -211,10 +540,20 @@ extern "C" int solveTasksGpuCuda(int board_minus,
         return 1;
     }
 
+    err = cudaGetDeviceProperties(&device_prop, 0);
+    if (cudaSuccess == err)
+    {
+        sm_count = device_prop.multiProcessorCount;
+    }
+    else
+    {
+        fprintf(stderr, "CUDA warning: failed to query device properties: %s\n", cudaGetErrorString(err));
+    }
+
     batch_capacity = (batch_tasks < task_count) ? batch_tasks : task_count;
-    max_blocks = (batch_capacity + CUDA_BLOCK_SIZE - 1) / CUDA_BLOCK_SIZE;
+    max_launch_blocks = getLaunchBlocksCap(batch_capacity);
     task_buffer_bytes = (size_t)batch_capacity * sizeof(NqueenTask);
-    partial_bytes = (size_t)max_blocks * sizeof(SOLUTIONTYPE);
+    partial_bytes = (size_t)max_launch_blocks * sizeof(SOLUTIONTYPE);
 
     if (print_timing)
     {
@@ -243,7 +582,7 @@ extern "C" int solveTasksGpuCuda(int board_minus,
         goto cleanup;
     }
 
-    if (max_blocks > 1)
+    if (max_launch_blocks > 1)
     {
         err = cudaMalloc((void**)&d_partial_b, partial_bytes);
         if (cudaSuccess != err)
@@ -253,10 +592,78 @@ extern "C" int solveTasksGpuCuda(int board_minus,
         }
     }
 
+    err = cudaMalloc((void**)&d_next_task, sizeof(unsigned int));
+    if (cudaSuccess != err)
+    {
+        fprintf(stderr, "CUDA error (cudaMalloc d_next_task): %s\n", cudaGetErrorString(err));
+        goto cleanup;
+    }
+
+    if (0 == persist_blocks && 0 == target_override && autotune_target)
+    {
+        int sample_tasks = task_count;
+        int sample_max_blocks;
+        int baseline_blocks;
+        int tuned_target = target_tasks_per_block;
+        int tuned_blocks = 0;
+        float tuned_ms = 0.0f;
+
+        if (sample_tasks > batch_capacity)
+        {
+            sample_tasks = batch_capacity;
+        }
+        if (sample_tasks > autotune_sample_tasks)
+        {
+            sample_tasks = autotune_sample_tasks;
+        }
+        sample_max_blocks = getLaunchBlocksCap(sample_tasks);
+        baseline_blocks = getPersistentLaunchBlocks(batch_capacity, sm_count, 0, target_tasks_per_block);
+
+        if (!shouldRunAutotuneSample(sample_max_blocks, baseline_blocks))
+        {
+            if (print_timing)
+            {
+                fprintf(stderr,
+                        "CUDA info: skipping autotune (sample_blocks=%d baseline_blocks=%d). Increase NQ_GPU_AUTOTUNE_SAMPLE_TASKS to enable.\n",
+                        sample_max_blocks,
+                        baseline_blocks);
+            }
+        }
+        else
+        {
+            err = cudaMemcpy(d_tasks,
+                             tasks,
+                             (size_t)sample_tasks * sizeof(NqueenTask),
+                             cudaMemcpyHostToDevice);
+            if (cudaSuccess != err)
+            {
+                fprintf(stderr, "CUDA warning: autotune H2D copy failed: %s\n", cudaGetErrorString(err));
+            }
+            else if (autotuneTargetTasksPerBlock(board_minus,
+                                                 mask,
+                                                 d_tasks,
+                                                 sample_tasks,
+                                                 sm_count,
+                                                 target_tasks_per_block,
+                                                 sample_max_blocks,
+                                                 d_next_task,
+                                                 d_partial_a,
+                                                 &tuned_target,
+                                                 &tuned_blocks,
+                                                 &tuned_ms))
+            {
+                target_tasks_per_block = tuned_target;
+                autotune_best_blocks = tuned_blocks;
+                autotune_kernel_ms = tuned_ms;
+                autotune_applied = 1;
+            }
+        }
+    }
+
     for (offset = 0; offset < task_count; offset += batch_capacity)
     {
         int current_tasks = task_count - offset;
-        int blocks;
+        int launch_blocks;
         int current_count;
         const SOLUTIONTYPE* d_reduce_in;
         SOLUTIONTYPE* d_reduce_out;
@@ -267,7 +674,15 @@ extern "C" int solveTasksGpuCuda(int board_minus,
         {
             current_tasks = batch_capacity;
         }
-        blocks = (current_tasks + CUDA_BLOCK_SIZE - 1) / CUDA_BLOCK_SIZE;
+        launch_blocks = getPersistentLaunchBlocks(current_tasks, sm_count, persist_blocks, target_tasks_per_block);
+        if (launch_blocks < 1)
+        {
+            launch_blocks = 1;
+        }
+        if (launch_blocks > max_blocks_used)
+        {
+            max_blocks_used = launch_blocks;
+        }
         ++batches;
 
         if (print_timing)
@@ -298,7 +713,14 @@ extern "C" int solveTasksGpuCuda(int board_minus,
             cudaEventRecord(ev_start, 0);
         }
 
-        solveTasksKernel<<<blocks, CUDA_BLOCK_SIZE>>>(board_minus, mask, d_tasks, current_tasks, d_partial_a);
+        err = cudaMemset(d_next_task, 0, sizeof(unsigned int));
+        if (cudaSuccess != err)
+        {
+            fprintf(stderr, "CUDA error (cudaMemset d_next_task): %s\n", cudaGetErrorString(err));
+            goto cleanup;
+        }
+
+        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE>>>(board_minus, mask, d_tasks, current_tasks, d_next_task, d_partial_a);
 
         err = cudaGetLastError();
         if (cudaSuccess != err)
@@ -307,7 +729,7 @@ extern "C" int solveTasksGpuCuda(int board_minus,
             goto cleanup;
         }
 
-        current_count = blocks;
+        current_count = launch_blocks;
         d_reduce_in = d_partial_a;
         while (current_count > 1)
         {
@@ -380,14 +802,19 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     if (print_timing)
     {
         fprintf(stderr,
-                "GPU timing (ms): H2D=%.3f kernel+reduce=%.3f D2H=%.3f tasks=%d batch_tasks=%d batches=%d max_blocks=%d total_passes=%d max_passes=%d\n",
+                "GPU timing (ms): H2D=%.3f kernel+reduce=%.3f D2H=%.3f tasks=%d batch_tasks=%d batches=%d max_blocks=%d target_tasks_per_block=%d persist_override=%d autotune_target=%d autotune_blocks=%d autotune_ms=%.3f total_passes=%d max_passes=%d\n",
                 h2d_total_ms,
                 kernel_total_ms,
                 d2h_total_ms,
                 task_count,
                 batch_capacity,
                 batches,
-                max_blocks,
+                max_blocks_used,
+                target_tasks_per_block,
+                persist_blocks,
+                autotune_applied,
+                autotune_best_blocks,
+                autotune_kernel_ms,
                 total_reduction_passes,
                 max_reduction_passes);
     }
@@ -395,6 +822,7 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     success = 1;
 
 cleanup:
+    if (d_next_task) cudaFree(d_next_task);
     if (d_partial_b) cudaFree(d_partial_b);
     if (d_partial_a) cudaFree(d_partial_a);
     if (d_tasks) cudaFree(d_tasks);
