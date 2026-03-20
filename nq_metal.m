@@ -6,13 +6,12 @@
  *      to the GPU in fixed-size chunks.  Memory usage is bounded at ~192 MB
  *      regardless of board size, so N=22 and N=23 are solvable on 32 GB machines.
  *   2. Each partial placement becomes one GPU thread that solves rows K..N-1
- *      using iterative backtracking identical to nq.c.
+ *      using iterative backtracking with 3-row leaf peeling.
  *   3. Each thread writes its local count to a results[] buffer.
  *   4. CPU accumulates all chunk totals and multiplies by 2 (mirror symmetry).
  *
- * K selection (pre-enumeration depth):
- *   Keep (N - K) ≈ 13 remaining rows per GPU thread so the worst-case subtree
- *   stays under the ~10 s macOS GPU watchdog.
+ * No checkpointing — K is raised high enough that individual threads complete
+ * well within the GPU watchdog window.
  */
 
 #import <Foundation/Foundation.h>
@@ -30,11 +29,9 @@
    8 M entries × (16 + 8) bytes = 192 MB — fits comfortably in 32 GB. */
 #define CHUNK_SIZE  8000000
 
-/* Max partial placements per GPU command buffer (GPU watchdog safety). */
-#define BATCH_SIZE  32000
-
-/* Sliding-window depth: command buffers in flight simultaneously. */
-#define WINDOW_SIZE 10
+/* Max partial placements per GPU dispatch.  64K threads keeps each dispatch
+   well under the watchdog while reducing per-dispatch overhead vs 32K. */
+#define BATCH_SIZE  65536
 
 typedef struct {
     uint32_t col;
@@ -42,6 +39,8 @@ typedef struct {
     uint32_t neg_diag;
     uint32_t init_bitfield;
 } PartialPlacement;
+
+_Static_assert(sizeof(PartialPlacement) == 16, "PartialPlacement size mismatch");
 
 /* ---- Globals shared between enumerate() and flush_to_gpu() --------------- */
 
@@ -53,9 +52,30 @@ static id<MTLComputePipelineState> g_pipeline;
 static id<MTLCommandQueue>         g_queue;
 static id<MTLBuffer>               g_partialsBuf;
 static id<MTLBuffer>               g_resultsBuf;
-static id<MTLBuffer>               g_bsBuf;
-static id<MTLBuffer>               g_srBuf;
 static NSUInteger                  g_tgSize;
+
+/* ---- Progress reporting -------------------------------------------------- */
+
+static time_t  g_start_time;
+static time_t  g_last_progress;
+static int     g_batches_done    = 0;
+static int     g_total_partials  = 0;
+
+static void print_progress(void)
+{
+    time_t now;
+    time(&now);
+    if (difftime(now, g_last_progress) < 60.0) return;
+    g_last_progress = now;
+
+    double elapsed = difftime(now, g_start_time);
+    int secs = (int)elapsed;
+    int h = secs / 3600, m = (secs % 3600) / 60, s = secs % 60;
+
+    printf("[%dh%02dm%02ds] %d batches, %d partials dispatched, %llu solutions so far\n",
+           h, m, s, g_batches_done, g_total_partials, g_total);
+    fflush(stdout);
+}
 
 /* ---- Flush one chunk of partial placements to the GPU -------------------- */
 
@@ -66,55 +86,45 @@ static void flush_to_gpu(void)
 
     memcpy([g_partialsBuf contents], g_partials,
            (size_t)num * sizeof(PartialPlacement));
-    memset([g_resultsBuf contents], 0, (size_t)num * sizeof(uint64_t));
 
-    uint64_t *results   = (uint64_t *)[g_resultsBuf contents];
-    int       num_batches = (num + BATCH_SIZE - 1) / BATCH_SIZE;
+    int num_batches = (num + BATCH_SIZE - 1) / BATCH_SIZE;
 
-    id<MTLCommandBuffer> window[WINDOW_SIZE];
-    int wStart[WINDOW_SIZE], wCount[WINDOW_SIZE];
-    memset(window, 0, sizeof(window));
+    for (int bidx = 0; bidx < num_batches; bidx++) {
+        int bs = bidx * BATCH_SIZE;
+        int bc = num - bs;
+        if (bc > BATCH_SIZE) bc = BATCH_SIZE;
 
-    int submitted = 0, completed = 0;
+        /* Clear results for this batch. */
+        memset((uint8_t *)[g_resultsBuf contents] + (size_t)bs * sizeof(uint64_t),
+               0, (size_t)bc * sizeof(uint64_t));
 
-#define SUBMIT_ONE(slot, bidx) do { \
-        int _bs = (bidx) * BATCH_SIZE; \
-        int _bc = num - _bs; if (_bc > BATCH_SIZE) _bc = BATCH_SIZE; \
-        NSUInteger _po = (NSUInteger)_bs * sizeof(PartialPlacement); \
-        NSUInteger _ro = (NSUInteger)_bs * sizeof(uint64_t); \
-        id<MTLCommandBuffer>         _cb  = [g_queue commandBuffer]; \
-        id<MTLComputeCommandEncoder> _enc = [_cb computeCommandEncoder]; \
-        [_enc setComputePipelineState:g_pipeline]; \
-        [_enc setBuffer:g_partialsBuf offset:_po atIndex:0]; \
-        [_enc setBuffer:g_resultsBuf  offset:_ro atIndex:1]; \
-        [_enc setBuffer:g_bsBuf       offset:0   atIndex:2]; \
-        [_enc setBuffer:g_srBuf       offset:0   atIndex:3]; \
-        [_enc dispatchThreads:MTLSizeMake((NSUInteger)_bc,1,1) \
-             threadsPerThreadgroup:MTLSizeMake(g_tgSize,1,1)]; \
-        [_enc endEncoding]; [_cb commit]; \
-        window[(slot)] = _cb; wStart[(slot)] = _bs; wCount[(slot)] = _bc; \
-    } while(0)
+        NSUInteger po = (NSUInteger)bs * sizeof(PartialPlacement);
+        NSUInteger ro = (NSUInteger)bs * sizeof(uint64_t);
 
-    while (submitted < num_batches && submitted - completed < WINDOW_SIZE) {
-        SUBMIT_ONE(submitted % WINDOW_SIZE, submitted); submitted++;
-    }
-    while (completed < num_batches) {
-        int slot = completed % WINDOW_SIZE;
-        [window[slot] waitUntilCompleted];
-        if (window[slot].status == MTLCommandBufferStatusError) {
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_pipeline];
+        [enc setBuffer:g_partialsBuf offset:po atIndex:0];
+        [enc setBuffer:g_resultsBuf  offset:ro atIndex:1];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)bc, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(g_tgSize, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        if (cb.status == MTLCommandBufferStatusError) {
             fprintf(stderr, "GPU error: %s\n",
-                    [window[slot].error.localizedDescription UTF8String]);
+                    [cb.error.localizedDescription UTF8String]);
             exit(1);
         }
-        int bs = wStart[slot], bc = wCount[slot];
+
+        uint64_t *results = (uint64_t *)[g_resultsBuf contents];
         for (int i = bs; i < bs + bc; i++) g_total += results[i];
-        window[slot] = nil;
-        completed++;
-        if (submitted < num_batches) {
-            SUBMIT_ONE(slot, submitted); submitted++;
-        }
+
+        g_batches_done++;
+        g_total_partials += bc;
+        print_progress();
     }
-#undef SUBMIT_ONE
 
     g_num_partials = 0;
 }
@@ -163,17 +173,16 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    /* Choose pre-enumeration depth K so that (N - K) ≈ 13 remaining rows,
-       keeping worst-case GPU thread time under the ~10 s watchdog. */
+    /* Choose pre-enumeration depth K.  Higher K = more, lighter GPU threads.
+       With 3-row leaf peeling, K=8 threads are light enough to avoid the
+       GPU watchdog without any checkpointing. */
     int K;
     if      (board_size <= 5)  K = 1;
     else if (board_size <= 9)  K = 2;
     else if (board_size <= 13) K = 3;
-    else if (board_size <= 16) K = 4;
     else if (board_size <= 19) K = 6;
-    else if (board_size <= 21) K = 8;
-    else if (board_size == 22) K = 10;
-    else                       K = 11;  /* N=23 */
+    else if (board_size <= 22) K = 8;
+    else                       K = 9;
     if (K >= board_size) K = board_size - 1;
 
     /* Fixed-size chunk buffer reused across GPU dispatches. */
@@ -184,8 +193,8 @@ int main(int argc, char **argv)
     int      half = board_size / 2;
     int      odd  = board_size & 1;
 
-    time_t t1, t2;
-    time(&t1);
+    time(&g_start_time);
+    g_last_progress = g_start_time;
     printf("N Queens (Metal) – board size %d\n", board_size);
 
     /* ---- Metal setup ----------------------------------------------------- */
@@ -208,8 +217,21 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    id<MTLFunction> kernelFn = [library newFunctionWithName:@"nqueen"];
-    if (!kernelFn) { fprintf(stderr, "Kernel 'nqueen' not found.\n"); return 1; }
+    /* Specialize kernel with compile-time board_size and start_row. */
+    MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
+    uint32_t cv_bs = (uint32_t)board_size;
+    uint32_t cv_sr = (uint32_t)K;
+    [cv setConstantValue:&cv_bs type:MTLDataTypeUInt atIndex:0];
+    [cv setConstantValue:&cv_sr type:MTLDataTypeUInt atIndex:1];
+
+    id<MTLFunction> kernelFn = [library newFunctionWithName:@"nqueen"
+                                             constantValues:cv
+                                                      error:&error];
+    if (!kernelFn) {
+        fprintf(stderr, "Kernel 'nqueen' not found: %s\n",
+                [[error localizedDescription] UTF8String]);
+        return 1;
+    }
 
     g_pipeline = [device newComputePipelineStateWithFunction:kernelFn error:&error];
     if (!g_pipeline) {
@@ -226,18 +248,11 @@ int main(int argc, char **argv)
     g_resultsBuf  = [device newBufferWithLength:sizeof(uint64_t) * CHUNK_SIZE
                                         options:MTLResourceStorageModeShared];
 
-    uint32_t bs = (uint32_t)board_size;
-    uint32_t sr = (uint32_t)K;
-    g_bsBuf = [device newBufferWithBytes:&bs length:4
-                                 options:MTLResourceStorageModeShared];
-    g_srBuf = [device newBufferWithBytes:&sr length:4
-                                 options:MTLResourceStorageModeShared];
-
     g_tgSize = g_pipeline.maxTotalThreadsPerThreadgroup;
     if (g_tgSize > 512) g_tgSize = 512;
 
-    printf("Streaming partial placements to GPU (K=%d, chunk=%dK)\n",
-           K, CHUNK_SIZE / 1000);
+    printf("Streaming partial placements to GPU (K=%d, chunk=%dM, batch=%dK)\n",
+           K, CHUNK_SIZE / 1000000, BATCH_SIZE / 1000);
 
     /* ---- Enumerate + stream to GPU --------------------------------------- */
 
@@ -269,8 +284,9 @@ int main(int argc, char **argv)
 
     g_total *= 2;  /* mirror symmetry */
 
+    time_t t2;
     time(&t2);
-    double secs    = difftime(t2, t1);
+    double secs    = difftime(t2, g_start_time);
     int    intsecs = (int)secs;
     int    hours   = intsecs / 3600;
     int    mins    = (intsecs % 3600) / 60;

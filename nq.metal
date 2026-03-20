@@ -3,43 +3,47 @@ using namespace metal;
 
 #define MAX_BOARDSIZE 23
 
+constant uint BOARD_SIZE [[function_constant(0)]];
+constant uint START_ROW  [[function_constant(1)]];
+
 struct PartialPlacement {
     uint col;
     uint pos_diag;
     uint neg_diag;
-    uint init_bitfield;  // pre-computed available positions for start_row
+    uint init_bitfield;
 };
 
+/* Primary kernel: each thread solves one partial placement to completion.
+   No checkpointing — K is raised high enough that threads complete
+   within the GPU watchdog window. */
 kernel void nqueen(
     device const PartialPlacement* partials [[buffer(0)]],
     device ulong*                  results  [[buffer(1)]],
-    constant uint&                 board_size [[buffer(2)]],
-    constant uint&                 start_row  [[buffer(3)]],
     uint tid [[thread_position_in_grid]])
 {
-    uint stack[MAX_BOARDSIZE + 2];
-    uint col_s[MAX_BOARDSIZE];
-    uint pos_s[MAX_BOARDSIZE];
-    uint neg_s[MAX_BOARDSIZE];
+    struct Frame { uint bf; uint col; uint pos; uint neg; };
+    Frame stk[MAX_BOARDSIZE + 2];
 
-    const uint mask        = (1u << board_size) - 1u;
-    const uint board_minus = board_size - 1u;
-    uint numrows = start_row;
+    const uint mask        = (1u << BOARD_SIZE) - 1u;
+    const uint board_minus = BOARD_SIZE - 1u;
+    uint numrows = START_ROW;
 
-    col_s[numrows] = partials[tid].col;
-    pos_s[numrows] = partials[tid].pos_diag;
-    neg_s[numrows] = partials[tid].neg_diag;
+    uint cur_col = partials[tid].col;
+    uint cur_pos = partials[tid].pos_diag;
+    uint cur_neg = partials[tid].neg_diag;
 
-    // sp=1: stack[0] is the sentinel slot; break when sp reaches 0
     uint sp = 1;
     uint bitfield = partials[tid].init_bitfield;
     ulong local_count = 0;
 
     for (;;) {
-        // Check before computing lsb — avoids a wasted NEG+AND on every backtrack.
         if (bitfield == 0u) {
-            bitfield = stack[--sp];
+            --sp;
             if (sp == 0u) break;
+            bitfield = stk[sp].bf;
+            cur_col  = stk[sp].col;
+            cur_pos  = stk[sp].pos;
+            cur_neg  = stk[sp].neg;
             --numrows;
             continue;
         }
@@ -47,24 +51,51 @@ kernel void nqueen(
         uint lsb = uint(-int(bitfield)) & bitfield;
         bitfield &= ~lsb;
 
-        if (numrows < board_minus - 1) {
-            // Normal descent: push state and go one row deeper.
-            uint n = numrows++;
-            col_s[numrows] = col_s[n] | lsb;
-            pos_s[numrows] = (pos_s[n] | lsb) << 1;
-            neg_s[numrows] = (neg_s[n] | lsb) >> 1;
-            stack[sp++] = bitfield;
-            bitfield = mask & ~(col_s[numrows] | pos_s[numrows] | neg_s[numrows]);
+        if (numrows < board_minus - 3) {
+            stk[sp].bf  = bitfield;
+            stk[sp].col = cur_col;
+            stk[sp].pos = cur_pos;
+            stk[sp].neg = cur_neg;
+            sp++;
+            cur_col = cur_col | lsb;
+            cur_pos = (cur_pos | lsb) << 1;
+            cur_neg = (cur_neg | lsb) >> 1;
+            numrows++;
+            bitfield = mask & ~(cur_col | cur_pos | cur_neg);
+        } else if (numrows == board_minus - 3) {
+            uint nc0 = cur_col | lsb;
+            uint np0 = (cur_pos | lsb) << 1;
+            uint nn0 = (cur_neg | lsb) >> 1;
+            uint bf0 = mask & ~(nc0 | np0 | nn0);
+            while (bf0) {
+                uint lsb0 = uint(-int(bf0)) & bf0;
+                bf0 &= ~lsb0;
+                uint nc1 = nc0 | lsb0;
+                uint np1 = (np0 | lsb0) << 1;
+                uint nn1 = (nn0 | lsb0) >> 1;
+                uint bf1 = mask & ~(nc1 | np1 | nn1);
+                while (bf1) {
+                    uint lsb1 = uint(-int(bf1)) & bf1;
+                    bf1 &= ~lsb1;
+                    local_count += popcount(mask & ~((nc1|lsb1)|((np1|lsb1)<<1)|((nn1|lsb1)>>1)));
+                }
+            }
+        } else if (numrows == board_minus - 2) {
+            uint nc1 = cur_col | lsb;
+            uint np1 = (cur_pos | lsb) << 1;
+            uint nn1 = (cur_neg | lsb) >> 1;
+            uint bf1 = mask & ~(nc1 | np1 | nn1);
+            while (bf1) {
+                uint lsb1 = uint(-int(bf1)) & bf1;
+                bf1 &= ~lsb1;
+                local_count += popcount(mask & ~((nc1 | lsb1) | ((np1 | lsb1) << 1) | ((nn1 | lsb1) >> 1)));
+            }
         } else if (numrows == board_minus - 1) {
-            // Second-to-last row: count all valid last-row placements in one
-            // popcount instead of iterating through them one at a time.
-            // Eliminates ~40-60% of total loop iterations.
-            uint nc = col_s[numrows] | lsb;
-            uint np = (pos_s[numrows] | lsb) << 1;
-            uint nn = (neg_s[numrows] | lsb) >> 1;
+            uint nc = cur_col | lsb;
+            uint np = (cur_pos | lsb) << 1;
+            uint nn = (cur_neg | lsb) >> 1;
             local_count += popcount(mask & ~(nc | np | nn));
         } else {
-            // Last row (only reachable for tiny boards where start_row == board_minus).
             ++local_count;
         }
     }
