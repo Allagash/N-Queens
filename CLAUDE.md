@@ -60,36 +60,33 @@ queued multiple primary batches before waiting crashed reliably on N=21 with
 `GPU resume error (slot 0): Internal Error`. The resume kernel's CB was queued
 behind other primary CBs; when an earlier one failed, the failure cascaded.
 
-**Rule**: always dispatch a batch, `waitUntilCompleted`, collect results, and
-drain checkpoints **before** submitting the next batch. The current sequential
-loop in `flush_to_gpu()` follows this pattern. Do not re-introduce a sliding
-window without first using **separate command queues** per slot (each queue
-serializes independently, so failures don't cascade).
+**Rule**: always dispatch a batch, `waitUntilCompleted`, collect results
+**before** submitting the next batch. The current sequential loop in
+`flush_to_gpu()` follows this pattern (with multi-dispatch encoding up to
+DISPATCHES_PER_CB batches per CB, which is safe since it's a single CB).
+Do not re-introduce a sliding window without first using **separate command
+queues** per slot.
 
-### ITER_BUDGET must be a static `#define`, not a function constant
+### Checkpointing was removed — use K tuning instead
 
-`ITER_BUDGET` controls how many main-loop iterations a GPU thread runs before
-checkpointing. It **must** be a `#define` in `nq.metal`, not a Metal function
-constant (`[[function_constant]]`).
+As of 2026-03-20, checkpointing (ITER_BUDGET, nqueen_resume kernel,
+drain_checkpoints) was removed. Instead, K is raised high enough that
+individual GPU threads complete within the watchdog window:
 
-When ITER_BUDGET was changed to a `constant uint [[function_constant(2)]]`,
-N=20 crashed with `Internal Error (0000000e)` at a budget of 1,000,000 — even
-though it ran correctly with `#define ITER_BUDGET 2000000u` and `500000u`.
-The Metal compiler generates different (less optimized) code for function
-constants vs compile-time literals, changing GPU timing and resource usage
-in ways that trigger the watchdog or other internal errors.
+- For N≥20: K = N - 13 (each thread handles exactly 13 rows)
+- For N≤19: K=6 or less (threads are light enough at any depth)
 
-### ITER_BUDGET must account for leaf-peeling inner work
+**The max safe thread depth is 13 rows** (9 stack + 4 peeled). 14 rows
+crashes reliably:
+- K=7 for N=21 → 14 rows → crashed at 14m (2026-03-20)
+- K=8 for N=22 → 14 rows → crashed at 1m22s (2026-03-20)
+- K=6 for N=20 → 14 rows → crashed at 2m51s (2026-03-20)
 
-The `iters` counter only counts main-loop iterations, **not** the O(N²) inner
-work in 3-row leaf-peeling cases. With 3-row peeling, the actual GPU work per
-thread is roughly `ITER_BUDGET × N²`.
+K = N - 13 gives: K=7 (N=20), K=8 (N=21), K=9 (N=22), K=10 (N=23).
 
-- `ITER_BUDGET=2,000,000`: N=21 crashed at 14m (watchdog on heavy batch)
-- `ITER_BUDGET=500,000`: N=22 crashed at 23m (still too high for N=22)
-- `ITER_BUDGET=200,000`: N=20 completes in 4m16s (correct, ~2x vs baseline 218s)
+BATCH_SIZE=65536 with DISPATCHES_PER_CB=16 keeps each CB under the
+watchdog. BATCH_SIZE=131072 crashes — too many threads per dispatch.
 
-**Rule**: when adding deeper leaf peeling (e.g. 4-row), reduce ITER_BUDGET
-proportionally. The product `ITER_BUDGET × (leaf inner work)` must keep the
-worst-case batch under ~30 seconds (half the watchdog, for safety margin).
-Current values: 3-row peeling with `#define ITER_BUDGET 200000u`.
+Historical note: ITER_BUDGET as a `[[function_constant]]` crashed even at
+values that worked as `#define`. The Metal compiler generates different code
+for function constants vs compile-time literals.

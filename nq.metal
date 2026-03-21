@@ -51,7 +51,7 @@ kernel void nqueen(
         uint lsb = uint(-int(bitfield)) & bitfield;
         bitfield &= ~lsb;
 
-        if (numrows < board_minus - 3) {
+        if (numrows + 5 <= board_minus) {
             stk[sp].bf  = bitfield;
             stk[sp].col = cur_col;
             stk[sp].pos = cur_pos;
@@ -62,7 +62,34 @@ kernel void nqueen(
             cur_neg = (cur_neg | lsb) >> 1;
             numrows++;
             bitfield = mask & ~(cur_col | cur_pos | cur_neg);
-        } else if (numrows == board_minus - 3) {
+        } else if (numrows + 4 == board_minus) {
+            /* 4-row leaf peel: rows N-4..N-1 handled without stack ops */
+            uint na = cur_col | lsb;
+            uint pa = (cur_pos | lsb) << 1;
+            uint ga = (cur_neg | lsb) >> 1;
+            uint bfa = mask & ~(na | pa | ga);
+            while (bfa) {
+                uint la = uint(-int(bfa)) & bfa;
+                bfa &= ~la;
+                uint nb = na | la;
+                uint pb = (pa | la) << 1;
+                uint gb = (ga | la) >> 1;
+                uint bfb = mask & ~(nb | pb | gb);
+                while (bfb) {
+                    uint lb = uint(-int(bfb)) & bfb;
+                    bfb &= ~lb;
+                    uint nc = nb | lb;
+                    uint pc = (pb | lb) << 1;
+                    uint gc = (gb | lb) >> 1;
+                    uint bfc = mask & ~(nc | pc | gc);
+                    while (bfc) {
+                        uint lc = uint(-int(bfc)) & bfc;
+                        bfc &= ~lc;
+                        local_count += popcount(mask & ~((nc|lc)|((pc|lc)<<1)|((gc|lc)>>1)));
+                    }
+                }
+            }
+        } else if (numrows + 3 == board_minus) {
             uint nc0 = cur_col | lsb;
             uint np0 = (cur_pos | lsb) << 1;
             uint nn0 = (cur_neg | lsb) >> 1;
@@ -80,7 +107,7 @@ kernel void nqueen(
                     local_count += popcount(mask & ~((nc1|lsb1)|((np1|lsb1)<<1)|((nn1|lsb1)>>1)));
                 }
             }
-        } else if (numrows == board_minus - 2) {
+        } else if (numrows + 2 == board_minus) {
             uint nc1 = cur_col | lsb;
             uint np1 = (cur_pos | lsb) << 1;
             uint nn1 = (cur_neg | lsb) >> 1;
@@ -90,7 +117,7 @@ kernel void nqueen(
                 bf1 &= ~lsb1;
                 local_count += popcount(mask & ~((nc1 | lsb1) | ((np1 | lsb1) << 1) | ((nn1 | lsb1) >> 1)));
             }
-        } else if (numrows == board_minus - 1) {
+        } else if (numrows + 1 == board_minus) {
             uint nc = cur_col | lsb;
             uint np = (cur_pos | lsb) << 1;
             uint nn = (cur_neg | lsb) >> 1;

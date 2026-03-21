@@ -6,7 +6,7 @@
  *      to the GPU in fixed-size chunks.  Memory usage is bounded at ~192 MB
  *      regardless of board size, so N=22 and N=23 are solvable on 32 GB machines.
  *   2. Each partial placement becomes one GPU thread that solves rows K..N-1
- *      using iterative backtracking with 3-row leaf peeling.
+ *      using iterative backtracking with 4-row leaf peeling.
  *   3. Each thread writes its local count to a results[] buffer.
  *   4. CPU accumulates all chunk totals and multiplies by 2 (mirror symmetry).
  *
@@ -33,6 +33,10 @@
    well under the watchdog while reducing per-dispatch overhead vs 32K. */
 #define BATCH_SIZE  65536
 
+/* Max batches to encode in a single command buffer.  Reduces CB creation
+   overhead while staying safely under the GPU watchdog (~60s). */
+#define DISPATCHES_PER_CB 16
+
 typedef struct {
     uint32_t col;
     uint32_t pos_diag;
@@ -58,8 +62,8 @@ static NSUInteger                  g_tgSize;
 
 static time_t  g_start_time;
 static time_t  g_last_progress;
-static int     g_batches_done    = 0;
-static int     g_total_partials  = 0;
+static int64_t g_batches_done    = 0;
+static int64_t g_total_partials  = 0;
 
 static void print_progress(void)
 {
@@ -72,7 +76,7 @@ static void print_progress(void)
     int secs = (int)elapsed;
     int h = secs / 3600, m = (secs % 3600) / 60, s = secs % 60;
 
-    printf("[%dh%02dm%02ds] %d batches, %d partials dispatched, %llu solutions so far\n",
+    printf("[%dh%02dm%02ds] %lld batches, %lld partials dispatched, %llu solutions so far\n",
            h, m, s, g_batches_done, g_total_partials, g_total);
     fflush(stdout);
 }
@@ -89,25 +93,34 @@ static void flush_to_gpu(void)
 
     int num_batches = (num + BATCH_SIZE - 1) / BATCH_SIZE;
 
-    for (int bidx = 0; bidx < num_batches; bidx++) {
-        int bs = bidx * BATCH_SIZE;
-        int bc = num - bs;
-        if (bc > BATCH_SIZE) bc = BATCH_SIZE;
+    /* Clear all results upfront. */
+    memset([g_resultsBuf contents], 0, (size_t)num * sizeof(uint64_t));
 
-        /* Clear results for this batch. */
-        memset((uint8_t *)[g_resultsBuf contents] + (size_t)bs * sizeof(uint64_t),
-               0, (size_t)bc * sizeof(uint64_t));
-
-        NSUInteger po = (NSUInteger)bs * sizeof(PartialPlacement);
-        NSUInteger ro = (NSUInteger)bs * sizeof(uint64_t);
+    /* Encode multiple dispatches per command buffer to reduce CB overhead. */
+    for (int bidx = 0; bidx < num_batches; ) {
+        int dispatches = num_batches - bidx;
+        if (dispatches > DISPATCHES_PER_CB) dispatches = DISPATCHES_PER_CB;
 
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:g_pipeline];
-        [enc setBuffer:g_partialsBuf offset:po atIndex:0];
-        [enc setBuffer:g_resultsBuf  offset:ro atIndex:1];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)bc, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(g_tgSize, 1, 1)];
+
+        int cb_end_idx = bidx + dispatches;
+
+        for (int d = bidx; d < cb_end_idx; d++) {
+            int bs = d * BATCH_SIZE;
+            int bc = num - bs;
+            if (bc > BATCH_SIZE) bc = BATCH_SIZE;
+
+            NSUInteger po = (NSUInteger)bs * sizeof(PartialPlacement);
+            NSUInteger ro = (NSUInteger)bs * sizeof(uint64_t);
+
+            [enc setComputePipelineState:g_pipeline];
+            [enc setBuffer:g_partialsBuf offset:po atIndex:0];
+            [enc setBuffer:g_resultsBuf  offset:ro atIndex:1];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)bc, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(g_tgSize, 1, 1)];
+        }
+
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -118,11 +131,20 @@ static void flush_to_gpu(void)
             exit(1);
         }
 
+        /* Collect results from all dispatches in this CB. */
+        int cb_total = 0;
         uint64_t *results = (uint64_t *)[g_resultsBuf contents];
-        for (int i = bs; i < bs + bc; i++) g_total += results[i];
+        for (int d = bidx; d < cb_end_idx; d++) {
+            int bs = d * BATCH_SIZE;
+            int bc = num - bs;
+            if (bc > BATCH_SIZE) bc = BATCH_SIZE;
+            for (int i = bs; i < bs + bc; i++) g_total += results[i];
+            cb_total += bc;
+        }
 
-        g_batches_done++;
-        g_total_partials += bc;
+        g_batches_done += dispatches;
+        g_total_partials += cb_total;
+        bidx = cb_end_idx;
         print_progress();
     }
 
@@ -174,15 +196,16 @@ int main(int argc, char **argv)
     }
 
     /* Choose pre-enumeration depth K.  Higher K = more, lighter GPU threads.
-       With 3-row leaf peeling, K=8 threads are light enough to avoid the
-       GPU watchdog without any checkpointing. */
+       With 4-row leaf peeling, the max safe thread depth is 13 rows
+       (9 stack rows + 4 peeled).  For N≥20, K = N - 13 keeps each thread
+       at exactly 13 rows, avoiding the GPU watchdog without checkpointing.
+       Empirically: 14 rows crashes (N=21/K=7, N=22/K=8 both hit watchdog). */
     int K;
     if      (board_size <= 5)  K = 1;
     else if (board_size <= 9)  K = 2;
     else if (board_size <= 13) K = 3;
     else if (board_size <= 19) K = 6;
-    else if (board_size <= 22) K = 8;
-    else                       K = 9;
+    else                       K = board_size - 13;
     if (K >= board_size) K = board_size - 1;
 
     /* Fixed-size chunk buffer reused across GPU dispatches. */
