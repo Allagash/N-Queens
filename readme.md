@@ -14,6 +14,7 @@ Runtime mode selection with CUDA build:
 - auto persist tuning target (tasks per block, default 8192): `NQ_GPU_TARGET_TASKS_PER_BLOCK=8192 ./nq 19`
 - optional startup auto-tune of target (default off): `NQ_GPU_AUTOTUNE_TARGET=1 ./nq 19`
 - auto-tune sample tasks (default 8192; use larger values like 65536+ on larger GPUs): `NQ_GPU_AUTOTUNE_SAMPLE_TASKS=16384 ./nq 19`
+- GPU pipeline slots for overlapped batch execution (default 2, max 2): `NQ_GPU_PIPELINE_SLOTS=1 ./nq 19`
 - GPU task bucketing (default off, opt-in): `NQ_GPU_BUCKET_TASKS=1 ./nq 19`
 - force CPU: `NQ_SOLVER_MODE=cpu ./nq 16`
 - force GPU attempt: `NQ_SOLVER_MODE=gpu ./nq 16`

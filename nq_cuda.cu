@@ -11,6 +11,8 @@
 #define DEFAULT_GPU_BATCH_TASKS 500000
 #define DEFAULT_GPU_TARGET_TASKS_PER_BLOCK 8192
 #define DEFAULT_GPU_AUTOTUNE_SAMPLE_TASKS 8192
+#define DEFAULT_GPU_PIPELINE_SLOTS 2
+#define MAX_GPU_PIPELINE_SLOTS 2
 
 static __device__ SOLUTIONTYPE solveTaskDevice(int board_minus,
                                                BITFIELDTYPE mask,
@@ -270,6 +272,110 @@ static int getGpuAutoTuneSampleTasks(void)
     return sample_tasks;
 }
 
+typedef struct
+{
+    cudaStream_t stream;
+    cudaEvent_t done_event;
+    cudaEvent_t h2d_start;
+    cudaEvent_t h2d_stop;
+    cudaEvent_t kernel_start;
+    cudaEvent_t kernel_stop;
+    cudaEvent_t d2h_start;
+    cudaEvent_t d2h_stop;
+    NqueenTask* d_tasks;
+    SOLUTIONTYPE* d_partial_a;
+    SOLUTIONTYPE* d_partial_b;
+    unsigned int* d_next_task;
+    int in_use;
+    int reduction_passes;
+} GpuPipelineSlot;
+
+static int getGpuPipelineSlots(void)
+{
+    const char* value = getenv("NQ_GPU_PIPELINE_SLOTS");
+    int slots = DEFAULT_GPU_PIPELINE_SLOTS;
+
+    if (value != NULL && *value != '\0')
+    {
+        char* endp = NULL;
+        long parsed = strtol(value, &endp, 10);
+        if (endp != value && parsed >= 1)
+        {
+            slots = (int)parsed;
+        }
+    }
+
+    if (slots < 1)
+    {
+        slots = 1;
+    }
+    if (slots > MAX_GPU_PIPELINE_SLOTS)
+    {
+        slots = MAX_GPU_PIPELINE_SLOTS;
+    }
+    return slots;
+}
+
+static int finalizePipelineSlot(GpuPipelineSlot* slot,
+                                int slot_index,
+                                SOLUTIONTYPE* h_batch_totals,
+                                int print_timing,
+                                float* h2d_total_ms,
+                                float* kernel_total_ms,
+                                float* d2h_total_ms,
+                                SOLUTIONTYPE* total,
+                                int* total_reduction_passes,
+                                int* max_reduction_passes)
+{
+    cudaError_t err;
+
+    if (!slot->in_use)
+    {
+        return 1;
+    }
+
+    err = cudaEventSynchronize(slot->done_event);
+    if (cudaSuccess != err)
+    {
+        fprintf(stderr, "CUDA error (stream sync): %s\n", cudaGetErrorString(err));
+        return 0;
+    }
+
+    *total += h_batch_totals[slot_index];
+    *total_reduction_passes += slot->reduction_passes;
+    if (slot->reduction_passes > *max_reduction_passes)
+    {
+        *max_reduction_passes = slot->reduction_passes;
+    }
+
+    if (print_timing)
+    {
+        float phase_ms = 0.0f;
+
+        err = cudaEventElapsedTime(&phase_ms, slot->h2d_start, slot->h2d_stop);
+        if (cudaSuccess == err)
+        {
+            *h2d_total_ms += phase_ms;
+        }
+
+        err = cudaEventElapsedTime(&phase_ms, slot->kernel_start, slot->kernel_stop);
+        if (cudaSuccess == err)
+        {
+            *kernel_total_ms += phase_ms;
+        }
+
+        err = cudaEventElapsedTime(&phase_ms, slot->d2h_start, slot->d2h_stop);
+        if (cudaSuccess == err)
+        {
+            *d2h_total_ms += phase_ms;
+        }
+    }
+
+    slot->in_use = 0;
+    slot->reduction_passes = 0;
+    return 1;
+}
+
 static int getLaunchBlocksCap(int current_tasks)
 {
     int blocks_by_cap = (current_tasks + (CUDA_BLOCK_SIZE * 8) - 1) / (CUDA_BLOCK_SIZE * 8);
@@ -497,20 +603,14 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     int max_launch_blocks;
     size_t task_buffer_bytes;
     size_t partial_bytes;
-    NqueenTask* d_tasks = NULL;
-    SOLUTIONTYPE* d_partial_a = NULL;
-    SOLUTIONTYPE* d_partial_b = NULL;
-    unsigned int* d_next_task = NULL;
+    GpuPipelineSlot slots[MAX_GPU_PIPELINE_SLOTS];
+    SOLUTIONTYPE h_batch_totals[MAX_GPU_PIPELINE_SLOTS];
     SOLUTIONTYPE total = 0;
-    SOLUTIONTYPE batch_total = 0;
     cudaError_t err;
     cudaDeviceProp device_prop;
-    cudaEvent_t ev_start = NULL;
-    cudaEvent_t ev_stop = NULL;
     float h2d_total_ms = 0.0f;
     float kernel_total_ms = 0.0f;
     float d2h_total_ms = 0.0f;
-    float phase_ms = 0.0f;
     int print_timing = shouldPrintGpuTiming();
     int batch_tasks = getGpuBatchTasks();
     int persist_blocks = getGpuPersistentBlocks();
@@ -521,6 +621,7 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     int autotune_applied = 0;
     int autotune_best_blocks = 0;
     float autotune_kernel_ms = 0.0f;
+    int slot_count = getGpuPipelineSlots();
     int sm_count = 0;
     int batches = 0;
     int total_reduction_passes = 0;
@@ -528,6 +629,10 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     int max_blocks_used = 0;
     int success = 0;
     int offset;
+    int i;
+
+    memset(slots, 0, sizeof(slots));
+    memset(h_batch_totals, 0, sizeof(h_batch_totals));
 
     if (NULL == total_out)
     {
@@ -555,48 +660,92 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     task_buffer_bytes = (size_t)batch_capacity * sizeof(NqueenTask);
     partial_bytes = (size_t)max_launch_blocks * sizeof(SOLUTIONTYPE);
 
-    if (print_timing)
+    for (i = 0; i < slot_count; ++i)
     {
-        if (cudaSuccess != cudaEventCreate(&ev_start) ||
-            cudaSuccess != cudaEventCreate(&ev_stop))
-        {
-            fprintf(stderr, "CUDA warning: failed to create timing events.\n");
-            if (ev_start) cudaEventDestroy(ev_start);
-            if (ev_stop) cudaEventDestroy(ev_stop);
-            ev_start = ev_stop = NULL;
-            print_timing = 0;
-        }
-    }
-
-    err = cudaMalloc((void**)&d_tasks, task_buffer_bytes);
-    if (cudaSuccess != err)
-    {
-        fprintf(stderr, "CUDA error (cudaMalloc d_tasks): %s\n", cudaGetErrorString(err));
-        goto cleanup;
-    }
-
-    err = cudaMalloc((void**)&d_partial_a, partial_bytes);
-    if (cudaSuccess != err)
-    {
-        fprintf(stderr, "CUDA error (cudaMalloc d_partial_a): %s\n", cudaGetErrorString(err));
-        goto cleanup;
-    }
-
-    if (max_launch_blocks > 1)
-    {
-        err = cudaMalloc((void**)&d_partial_b, partial_bytes);
+        err = cudaStreamCreateWithFlags(&slots[i].stream, cudaStreamNonBlocking);
         if (cudaSuccess != err)
         {
-            fprintf(stderr, "CUDA error (cudaMalloc d_partial_b): %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "CUDA error (cudaStreamCreate): %s\n", cudaGetErrorString(err));
             goto cleanup;
         }
-    }
 
-    err = cudaMalloc((void**)&d_next_task, sizeof(unsigned int));
-    if (cudaSuccess != err)
-    {
-        fprintf(stderr, "CUDA error (cudaMalloc d_next_task): %s\n", cudaGetErrorString(err));
-        goto cleanup;
+        err = cudaEventCreateWithFlags(&slots[i].done_event, cudaEventDisableTiming);
+        if (cudaSuccess != err)
+        {
+            fprintf(stderr, "CUDA error (cudaEventCreate done_event): %s\n", cudaGetErrorString(err));
+            goto cleanup;
+        }
+
+        if (print_timing)
+        {
+            err = cudaEventCreate(&slots[i].h2d_start);
+            if (cudaSuccess != err)
+            {
+                fprintf(stderr, "CUDA error (cudaEventCreate h2d_start): %s\n", cudaGetErrorString(err));
+                goto cleanup;
+            }
+            err = cudaEventCreate(&slots[i].h2d_stop);
+            if (cudaSuccess != err)
+            {
+                fprintf(stderr, "CUDA error (cudaEventCreate h2d_stop): %s\n", cudaGetErrorString(err));
+                goto cleanup;
+            }
+            err = cudaEventCreate(&slots[i].kernel_start);
+            if (cudaSuccess != err)
+            {
+                fprintf(stderr, "CUDA error (cudaEventCreate kernel_start): %s\n", cudaGetErrorString(err));
+                goto cleanup;
+            }
+            err = cudaEventCreate(&slots[i].kernel_stop);
+            if (cudaSuccess != err)
+            {
+                fprintf(stderr, "CUDA error (cudaEventCreate kernel_stop): %s\n", cudaGetErrorString(err));
+                goto cleanup;
+            }
+            err = cudaEventCreate(&slots[i].d2h_start);
+            if (cudaSuccess != err)
+            {
+                fprintf(stderr, "CUDA error (cudaEventCreate d2h_start): %s\n", cudaGetErrorString(err));
+                goto cleanup;
+            }
+            err = cudaEventCreate(&slots[i].d2h_stop);
+            if (cudaSuccess != err)
+            {
+                fprintf(stderr, "CUDA error (cudaEventCreate d2h_stop): %s\n", cudaGetErrorString(err));
+                goto cleanup;
+            }
+        }
+
+        err = cudaMalloc((void**)&slots[i].d_tasks, task_buffer_bytes);
+        if (cudaSuccess != err)
+        {
+            fprintf(stderr, "CUDA error (cudaMalloc d_tasks): %s\n", cudaGetErrorString(err));
+            goto cleanup;
+        }
+
+        err = cudaMalloc((void**)&slots[i].d_partial_a, partial_bytes);
+        if (cudaSuccess != err)
+        {
+            fprintf(stderr, "CUDA error (cudaMalloc d_partial_a): %s\n", cudaGetErrorString(err));
+            goto cleanup;
+        }
+
+        if (max_launch_blocks > 1)
+        {
+            err = cudaMalloc((void**)&slots[i].d_partial_b, partial_bytes);
+            if (cudaSuccess != err)
+            {
+                fprintf(stderr, "CUDA error (cudaMalloc d_partial_b): %s\n", cudaGetErrorString(err));
+                goto cleanup;
+            }
+        }
+
+        err = cudaMalloc((void**)&slots[i].d_next_task, sizeof(unsigned int));
+        if (cudaSuccess != err)
+        {
+            fprintf(stderr, "CUDA error (cudaMalloc d_next_task): %s\n", cudaGetErrorString(err));
+            goto cleanup;
+        }
     }
 
     if (0 == persist_blocks && 0 == target_override && autotune_target)
@@ -631,7 +780,7 @@ extern "C" int solveTasksGpuCuda(int board_minus,
         }
         else
         {
-            err = cudaMemcpy(d_tasks,
+            err = cudaMemcpy(slots[0].d_tasks,
                              tasks,
                              (size_t)sample_tasks * sizeof(NqueenTask),
                              cudaMemcpyHostToDevice);
@@ -641,13 +790,13 @@ extern "C" int solveTasksGpuCuda(int board_minus,
             }
             else if (autotuneTargetTasksPerBlock(board_minus,
                                                  mask,
-                                                 d_tasks,
+                                                 slots[0].d_tasks,
                                                  sample_tasks,
                                                  sm_count,
                                                  target_tasks_per_block,
                                                  sample_max_blocks,
-                                                 d_next_task,
-                                                 d_partial_a,
+                                                 slots[0].d_next_task,
+                                                 slots[0].d_partial_a,
                                                  &tuned_target,
                                                  &tuned_blocks,
                                                  &tuned_ms))
@@ -662,6 +811,8 @@ extern "C" int solveTasksGpuCuda(int board_minus,
 
     for (offset = 0; offset < task_count; offset += batch_capacity)
     {
+        int slot_index = (offset / batch_capacity) % slot_count;
+        GpuPipelineSlot* slot = &slots[slot_index];
         int current_tasks = task_count - offset;
         int launch_blocks;
         int current_count;
@@ -669,11 +820,27 @@ extern "C" int solveTasksGpuCuda(int board_minus,
         SOLUTIONTYPE* d_reduce_out;
         const SOLUTIONTYPE* d_final;
         int reduction_passes = 0;
+        size_t copy_bytes;
+
+        if (!finalizePipelineSlot(slot,
+                                  slot_index,
+                                  h_batch_totals,
+                                  print_timing,
+                                  &h2d_total_ms,
+                                  &kernel_total_ms,
+                                  &d2h_total_ms,
+                                  &total,
+                                  &total_reduction_passes,
+                                  &max_reduction_passes))
+        {
+            goto cleanup;
+        }
 
         if (current_tasks > batch_capacity)
         {
             current_tasks = batch_capacity;
         }
+        copy_bytes = (size_t)current_tasks * sizeof(NqueenTask);
         launch_blocks = getPersistentLaunchBlocks(current_tasks, sm_count, persist_blocks, target_tasks_per_block);
         if (launch_blocks < 1)
         {
@@ -687,13 +854,14 @@ extern "C" int solveTasksGpuCuda(int board_minus,
 
         if (print_timing)
         {
-            cudaEventRecord(ev_start, 0);
+            cudaEventRecord(slot->h2d_start, slot->stream);
         }
 
-        err = cudaMemcpy(d_tasks,
-                         tasks + offset,
-                         (size_t)current_tasks * sizeof(NqueenTask),
-                         cudaMemcpyHostToDevice);
+        err = cudaMemcpyAsync(slot->d_tasks,
+                              tasks + offset,
+                              copy_bytes,
+                              cudaMemcpyHostToDevice,
+                              slot->stream);
         if (cudaSuccess != err)
         {
             fprintf(stderr, "CUDA error (cudaMemcpy H2D tasks): %s\n", cudaGetErrorString(err));
@@ -702,25 +870,27 @@ extern "C" int solveTasksGpuCuda(int board_minus,
 
         if (print_timing)
         {
-            cudaEventRecord(ev_stop, 0);
-            cudaEventSynchronize(ev_stop);
-            cudaEventElapsedTime(&phase_ms, ev_start, ev_stop);
-            h2d_total_ms += phase_ms;
+            cudaEventRecord(slot->h2d_stop, slot->stream);
         }
 
         if (print_timing)
         {
-            cudaEventRecord(ev_start, 0);
+            cudaEventRecord(slot->kernel_start, slot->stream);
         }
 
-        err = cudaMemset(d_next_task, 0, sizeof(unsigned int));
+        err = cudaMemsetAsync(slot->d_next_task, 0, sizeof(unsigned int), slot->stream);
         if (cudaSuccess != err)
         {
             fprintf(stderr, "CUDA error (cudaMemset d_next_task): %s\n", cudaGetErrorString(err));
             goto cleanup;
         }
 
-        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE>>>(board_minus, mask, d_tasks, current_tasks, d_next_task, d_partial_a);
+        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE, 0, slot->stream>>>(board_minus,
+                                                                               mask,
+                                                                               slot->d_tasks,
+                                                                               current_tasks,
+                                                                               slot->d_next_task,
+                                                                               slot->d_partial_a);
 
         err = cudaGetLastError();
         if (cudaSuccess != err)
@@ -730,18 +900,18 @@ extern "C" int solveTasksGpuCuda(int board_minus,
         }
 
         current_count = launch_blocks;
-        d_reduce_in = d_partial_a;
+        d_reduce_in = slot->d_partial_a;
         while (current_count > 1)
         {
             int out_count = (current_count + CUDA_BLOCK_SIZE - 1) / CUDA_BLOCK_SIZE;
-            if (NULL == d_partial_b)
+            if (NULL == slot->d_partial_b)
             {
                 fprintf(stderr, "CUDA error: reduction buffer not allocated.\n");
                 goto cleanup;
             }
 
-            d_reduce_out = (d_reduce_in == d_partial_a) ? d_partial_b : d_partial_a;
-            reduceSumsKernel<<<out_count, CUDA_BLOCK_SIZE>>>(d_reduce_in, current_count, d_reduce_out);
+            d_reduce_out = (d_reduce_in == slot->d_partial_a) ? slot->d_partial_b : slot->d_partial_a;
+            reduceSumsKernel<<<out_count, CUDA_BLOCK_SIZE, 0, slot->stream>>>(d_reduce_in, current_count, d_reduce_out);
             err = cudaGetLastError();
             if (cudaSuccess != err)
             {
@@ -754,27 +924,21 @@ extern "C" int solveTasksGpuCuda(int board_minus,
         }
         d_final = d_reduce_in;
 
-        err = cudaDeviceSynchronize();
-        if (cudaSuccess != err)
+        if (print_timing)
         {
-            fprintf(stderr, "CUDA error (kernel sync): %s\n", cudaGetErrorString(err));
-            goto cleanup;
+            cudaEventRecord(slot->kernel_stop, slot->stream);
         }
 
         if (print_timing)
         {
-            cudaEventRecord(ev_stop, 0);
-            cudaEventSynchronize(ev_stop);
-            cudaEventElapsedTime(&phase_ms, ev_start, ev_stop);
-            kernel_total_ms += phase_ms;
+            cudaEventRecord(slot->d2h_start, slot->stream);
         }
 
-        if (print_timing)
-        {
-            cudaEventRecord(ev_start, 0);
-        }
-
-        err = cudaMemcpy(&batch_total, d_final, sizeof(SOLUTIONTYPE), cudaMemcpyDeviceToHost);
+        err = cudaMemcpyAsync(&h_batch_totals[slot_index],
+                              d_final,
+                              sizeof(SOLUTIONTYPE),
+                              cudaMemcpyDeviceToHost,
+                              slot->stream);
         if (cudaSuccess != err)
         {
             fprintf(stderr, "CUDA error (cudaMemcpy D2H total): %s\n", cudaGetErrorString(err));
@@ -783,17 +947,34 @@ extern "C" int solveTasksGpuCuda(int board_minus,
 
         if (print_timing)
         {
-            cudaEventRecord(ev_stop, 0);
-            cudaEventSynchronize(ev_stop);
-            cudaEventElapsedTime(&phase_ms, ev_start, ev_stop);
-            d2h_total_ms += phase_ms;
+            cudaEventRecord(slot->d2h_stop, slot->stream);
         }
 
-        total += batch_total;
-        total_reduction_passes += reduction_passes;
-        if (reduction_passes > max_reduction_passes)
+        err = cudaEventRecord(slot->done_event, slot->stream);
+        if (cudaSuccess != err)
         {
-            max_reduction_passes = reduction_passes;
+            fprintf(stderr, "CUDA error (cudaEventRecord done_event): %s\n", cudaGetErrorString(err));
+            goto cleanup;
+        }
+
+        slot->reduction_passes = reduction_passes;
+        slot->in_use = 1;
+    }
+
+    for (i = 0; i < slot_count; ++i)
+    {
+        if (!finalizePipelineSlot(&slots[i],
+                                  i,
+                                  h_batch_totals,
+                                  print_timing,
+                                  &h2d_total_ms,
+                                  &kernel_total_ms,
+                                  &d2h_total_ms,
+                                  &total,
+                                  &total_reduction_passes,
+                                  &max_reduction_passes))
+        {
+            goto cleanup;
         }
     }
 
@@ -802,13 +983,14 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     if (print_timing)
     {
         fprintf(stderr,
-                "GPU timing (ms): H2D=%.3f kernel+reduce=%.3f D2H=%.3f tasks=%d batch_tasks=%d batches=%d max_blocks=%d target_tasks_per_block=%d persist_override=%d autotune_target=%d autotune_blocks=%d autotune_ms=%.3f total_passes=%d max_passes=%d\n",
+                "GPU timing (ms): H2D=%.3f kernel+reduce=%.3f D2H=%.3f tasks=%d batch_tasks=%d batches=%d pipeline_slots=%d max_blocks=%d target_tasks_per_block=%d persist_override=%d autotune_target=%d autotune_blocks=%d autotune_ms=%.3f total_passes=%d max_passes=%d\n",
                 h2d_total_ms,
                 kernel_total_ms,
                 d2h_total_ms,
                 task_count,
                 batch_capacity,
                 batches,
+                slot_count,
                 max_blocks_used,
                 target_tasks_per_block,
                 persist_blocks,
@@ -822,12 +1004,22 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     success = 1;
 
 cleanup:
-    if (d_next_task) cudaFree(d_next_task);
-    if (d_partial_b) cudaFree(d_partial_b);
-    if (d_partial_a) cudaFree(d_partial_a);
-    if (d_tasks) cudaFree(d_tasks);
-    if (ev_start) cudaEventDestroy(ev_start);
-    if (ev_stop) cudaEventDestroy(ev_stop);
+    for (i = 0; i < MAX_GPU_PIPELINE_SLOTS; ++i)
+    {
+        if (slots[i].stream) cudaStreamSynchronize(slots[i].stream);
+        if (slots[i].d_next_task) cudaFree(slots[i].d_next_task);
+        if (slots[i].d_partial_b) cudaFree(slots[i].d_partial_b);
+        if (slots[i].d_partial_a) cudaFree(slots[i].d_partial_a);
+        if (slots[i].d_tasks) cudaFree(slots[i].d_tasks);
+        if (slots[i].d2h_stop) cudaEventDestroy(slots[i].d2h_stop);
+        if (slots[i].d2h_start) cudaEventDestroy(slots[i].d2h_start);
+        if (slots[i].kernel_stop) cudaEventDestroy(slots[i].kernel_stop);
+        if (slots[i].kernel_start) cudaEventDestroy(slots[i].kernel_start);
+        if (slots[i].h2d_stop) cudaEventDestroy(slots[i].h2d_stop);
+        if (slots[i].h2d_start) cudaEventDestroy(slots[i].h2d_start);
+        if (slots[i].done_event) cudaEventDestroy(slots[i].done_event);
+        if (slots[i].stream) cudaStreamDestroy(slots[i].stream);
+    }
     return success;
 }
 
