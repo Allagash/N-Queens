@@ -7,7 +7,8 @@
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 
-#define CUDA_BLOCK_SIZE 256
+#define CUDA_BLOCK_SIZE 64
+#define GPU_KERNEL_DEFAULT_SMEM_LIMIT (48 * 1024)
 #define DEFAULT_GPU_BATCH_TASKS 500000
 #define DEFAULT_GPU_TARGET_TASKS_PER_BLOCK 8192
 #define DEFAULT_GPU_AUTOTUNE_SAMPLE_TASKS 8192
@@ -16,12 +17,12 @@
 
 static __device__ SOLUTIONTYPE solveTaskDevice(int board_minus,
                                                BITFIELDTYPE mask,
+                                               BITFIELDTYPE* s_col,
+                                               BITFIELDTYPE* s_pos,
+                                               BITFIELDTYPE* s_neg,
+                                               BITFIELDTYPE* s_stack,
                                                NqueenTask task)
 {
-    BITFIELDTYPE aQueenBitCol[MAX_BOARDSIZE];
-    BITFIELDTYPE aQueenBitPosDiag[MAX_BOARDSIZE];
-    BITFIELDTYPE aQueenBitNegDiag[MAX_BOARDSIZE];
-    BITFIELDTYPE aStack[MAX_BOARDSIZE + 1];
     BITFIELDTYPE bitfield;
     BITFIELDTYPE lsb;
     int numrows;
@@ -31,9 +32,9 @@ static __device__ SOLUTIONTYPE solveTaskDevice(int board_minus,
     numrows = task.start_numrows;
     stack_count = 0;
     bitfield = task.bitfield;
-    aQueenBitCol[numrows] = task.col;
-    aQueenBitPosDiag[numrows] = task.pos_diag;
-    aQueenBitNegDiag[numrows] = task.neg_diag;
+    s_col[numrows] = task.col;
+    s_pos[numrows] = task.pos_diag;
+    s_neg[numrows] = task.neg_diag;
 
     for (;;)
     {
@@ -43,7 +44,7 @@ static __device__ SOLUTIONTYPE solveTaskDevice(int board_minus,
             {
                 break;
             }
-            bitfield = aStack[--stack_count];
+            bitfield = s_stack[--stack_count];
             --numrows;
             continue;
         }
@@ -54,11 +55,11 @@ static __device__ SOLUTIONTYPE solveTaskDevice(int board_minus,
         if (numrows < board_minus)
         {
             int n = numrows++;
-            aQueenBitCol[numrows] = aQueenBitCol[n] | lsb;
-            aQueenBitNegDiag[numrows] = (aQueenBitNegDiag[n] | lsb) >> 1;
-            aQueenBitPosDiag[numrows] = (aQueenBitPosDiag[n] | lsb) << 1;
-            aStack[stack_count++] = bitfield;
-            bitfield = mask & ~(aQueenBitCol[numrows] | aQueenBitNegDiag[numrows] | aQueenBitPosDiag[numrows]);
+            s_col[numrows] = s_col[n] | lsb;
+            s_neg[numrows] = (s_neg[n] | lsb) >> 1;
+            s_pos[numrows] = (s_pos[n] | lsb) << 1;
+            s_stack[stack_count++] = bitfield;
+            bitfield = mask & ~(s_col[numrows] | s_neg[numrows] | s_pos[numrows]);
             continue;
         }
 
@@ -67,7 +68,7 @@ static __device__ SOLUTIONTYPE solveTaskDevice(int board_minus,
         {
             break;
         }
-        bitfield = aStack[--stack_count];
+        bitfield = s_stack[--stack_count];
         --numrows;
     }
 
@@ -76,12 +77,21 @@ static __device__ SOLUTIONTYPE solveTaskDevice(int board_minus,
 
 static __global__ void solveTasksKernel(int board_minus,
                                         BITFIELDTYPE mask,
+                                        int depth_stride,
                                         const NqueenTask* tasks,
                                         int task_count,
                                         unsigned int* next_task,
                                         SOLUTIONTYPE* block_sums)
 {
+    extern __shared__ unsigned long long s_dyn[];
     __shared__ SOLUTIONTYPE shared_sums[CUDA_BLOCK_SIZE];
+
+    BITFIELDTYPE* s_thread = (BITFIELDTYPE*)s_dyn + (size_t)threadIdx.x * 4 * depth_stride;
+    BITFIELDTYPE* s_col   = s_thread;
+    BITFIELDTYPE* s_pos   = s_thread + depth_stride;
+    BITFIELDTYPE* s_neg   = s_thread + 2 * depth_stride;
+    BITFIELDTYPE* s_stack = s_thread + 3 * depth_stride;
+
     SOLUTIONTYPE local = 0;
 
     for (;;)
@@ -91,7 +101,7 @@ static __global__ void solveTasksKernel(int board_minus,
         {
             break;
         }
-        local += solveTaskDevice(board_minus, mask, tasks[idx]);
+        local += solveTaskDevice(board_minus, mask, s_col, s_pos, s_neg, s_stack, tasks[idx]);
     }
 
     shared_sums[threadIdx.x] = local;
@@ -483,6 +493,8 @@ static int shouldRunAutotuneSample(int sample_max_blocks, int baseline_blocks)
 
 static int autotuneTargetTasksPerBlock(int board_minus,
                                        BITFIELDTYPE mask,
+                                       int depth_stride,
+                                       size_t dyn_shared_bytes,
                                        const NqueenTask* d_tasks,
                                        int sample_tasks,
                                        int sm_count,
@@ -556,7 +568,7 @@ static int autotuneTargetTasksPerBlock(int board_minus,
         }
 
         cudaEventRecord(ev_start, 0);
-        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE>>>(board_minus, mask, d_tasks, sample_tasks, d_next_task, d_partial_a);
+        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE, dyn_shared_bytes>>>(board_minus, mask, depth_stride, d_tasks, sample_tasks, d_next_task, d_partial_a);
         err = cudaGetLastError();
         if (cudaSuccess != err)
         {
@@ -630,6 +642,8 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     int success = 0;
     int offset;
     int i;
+    int depth_stride;
+    size_t dyn_shared_bytes;
 
     memset(slots, 0, sizeof(slots));
     memset(h_batch_totals, 0, sizeof(h_batch_totals));
@@ -653,6 +667,46 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     else
     {
         fprintf(stderr, "CUDA warning: failed to query device properties: %s\n", cudaGetErrorString(err));
+    }
+
+    depth_stride = board_minus + 1;
+    if (depth_stride < 1)
+    {
+        depth_stride = 1;
+    }
+    dyn_shared_bytes = (size_t)4 * sizeof(BITFIELDTYPE) * (size_t)depth_stride * (size_t)CUDA_BLOCK_SIZE;
+
+    if (dyn_shared_bytes > (size_t)GPU_KERNEL_DEFAULT_SMEM_LIMIT)
+    {
+        int device_max_optin = GPU_KERNEL_DEFAULT_SMEM_LIMIT;
+        cudaError_t attr_err;
+
+        cudaDeviceGetAttribute(&device_max_optin,
+                               cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               0);
+
+        if (dyn_shared_bytes > (size_t)device_max_optin)
+        {
+            fprintf(stderr,
+                    "CUDA error: required dynamic shared memory %zu bytes exceeds device opt-in cap %d bytes (board_size=%d). Reduce CUDA_BLOCK_SIZE or board size.\n",
+                    dyn_shared_bytes,
+                    device_max_optin,
+                    board_minus + 1);
+            return 0;
+        }
+
+        attr_err = cudaFuncSetAttribute(solveTasksKernel,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        (int)dyn_shared_bytes);
+        cudaGetLastError();
+        if (cudaSuccess != attr_err)
+        {
+            fprintf(stderr,
+                    "CUDA error: cudaFuncSetAttribute(MaxDynamicSharedMemorySize=%zu) failed: %s\n",
+                    dyn_shared_bytes,
+                    cudaGetErrorString(attr_err));
+            return 0;
+        }
     }
 
     batch_capacity = (batch_tasks < task_count) ? batch_tasks : task_count;
@@ -790,6 +844,8 @@ extern "C" int solveTasksGpuCuda(int board_minus,
             }
             else if (autotuneTargetTasksPerBlock(board_minus,
                                                  mask,
+                                                 depth_stride,
+                                                 dyn_shared_bytes,
                                                  slots[0].d_tasks,
                                                  sample_tasks,
                                                  sm_count,
@@ -885,8 +941,9 @@ extern "C" int solveTasksGpuCuda(int board_minus,
             goto cleanup;
         }
 
-        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE, 0, slot->stream>>>(board_minus,
+        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE, dyn_shared_bytes, slot->stream>>>(board_minus,
                                                                                mask,
+                                                                               depth_stride,
                                                                                slot->d_tasks,
                                                                                current_tasks,
                                                                                slot->d_next_task,
