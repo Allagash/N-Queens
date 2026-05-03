@@ -15,7 +15,8 @@
 #define DEFAULT_GPU_PIPELINE_SLOTS 2
 #define MAX_GPU_PIPELINE_SLOTS 2
 
-static __device__ SOLUTIONTYPE solveTaskDevice(int board_minus,
+static __device__ SOLUTIONTYPE solveTaskDevice(int start_offset,
+                                               int last_row,
                                                BITFIELDTYPE mask,
                                                BITFIELDTYPE* s_col,
                                                BITFIELDTYPE* s_pos,
@@ -25,16 +26,16 @@ static __device__ SOLUTIONTYPE solveTaskDevice(int board_minus,
 {
     BITFIELDTYPE bitfield;
     BITFIELDTYPE lsb;
-    int numrows;
+    int row;
     int stack_count;
     SOLUTIONTYPE solutions = 0;
 
-    numrows = task.start_numrows;
+    row = task.start_numrows - start_offset;
     stack_count = 0;
     bitfield = task.bitfield;
-    s_col[numrows] = task.col;
-    s_pos[numrows] = task.pos_diag;
-    s_neg[numrows] = task.neg_diag;
+    s_col[row] = task.col;
+    s_pos[row] = task.pos_diag;
+    s_neg[row] = task.neg_diag;
 
     for (;;)
     {
@@ -45,21 +46,21 @@ static __device__ SOLUTIONTYPE solveTaskDevice(int board_minus,
                 break;
             }
             bitfield = s_stack[--stack_count];
-            --numrows;
+            --row;
             continue;
         }
 
         lsb = bitfield & (~bitfield + 1);
         bitfield &= ~lsb;
 
-        if (numrows < board_minus)
+        if (row < last_row)
         {
-            int n = numrows++;
-            s_col[numrows] = s_col[n] | lsb;
-            s_neg[numrows] = (s_neg[n] | lsb) >> 1;
-            s_pos[numrows] = (s_pos[n] | lsb) << 1;
+            int n = row++;
+            s_col[row] = s_col[n] | lsb;
+            s_neg[row] = (s_neg[n] | lsb) >> 1;
+            s_pos[row] = (s_pos[n] | lsb) << 1;
             s_stack[stack_count++] = bitfield;
-            bitfield = mask & ~(s_col[numrows] | s_neg[numrows] | s_pos[numrows]);
+            bitfield = mask & ~(s_col[row] | s_neg[row] | s_pos[row]);
             continue;
         }
 
@@ -69,13 +70,14 @@ static __device__ SOLUTIONTYPE solveTaskDevice(int board_minus,
             break;
         }
         bitfield = s_stack[--stack_count];
-        --numrows;
+        --row;
     }
 
     return solutions;
 }
 
-static __global__ void solveTasksKernel(int board_minus,
+static __global__ void solveTasksKernel(int start_offset,
+                                        int last_row,
                                         BITFIELDTYPE mask,
                                         int depth_stride,
                                         const NqueenTask* tasks,
@@ -101,7 +103,7 @@ static __global__ void solveTasksKernel(int board_minus,
         {
             break;
         }
-        local += solveTaskDevice(board_minus, mask, s_col, s_pos, s_neg, s_stack, tasks[idx]);
+        local += solveTaskDevice(start_offset, last_row, mask, s_col, s_pos, s_neg, s_stack, tasks[idx]);
     }
 
     shared_sums[threadIdx.x] = local;
@@ -491,7 +493,8 @@ static int shouldRunAutotuneSample(int sample_max_blocks, int baseline_blocks)
     return 1;
 }
 
-static int autotuneTargetTasksPerBlock(int board_minus,
+static int autotuneTargetTasksPerBlock(int start_offset,
+                                       int last_row,
                                        BITFIELDTYPE mask,
                                        int depth_stride,
                                        size_t dyn_shared_bytes,
@@ -568,7 +571,7 @@ static int autotuneTargetTasksPerBlock(int board_minus,
         }
 
         cudaEventRecord(ev_start, 0);
-        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE, dyn_shared_bytes>>>(board_minus, mask, depth_stride, d_tasks, sample_tasks, d_next_task, d_partial_a);
+        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE, dyn_shared_bytes>>>(start_offset, last_row, mask, depth_stride, d_tasks, sample_tasks, d_next_task, d_partial_a);
         err = cudaGetLastError();
         if (cudaSuccess != err)
         {
@@ -643,6 +646,8 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     int offset;
     int i;
     int depth_stride;
+    int start_offset;
+    int last_row;
     size_t dyn_shared_bytes;
 
     memset(slots, 0, sizeof(slots));
@@ -669,7 +674,24 @@ extern "C" int solveTasksGpuCuda(int board_minus,
         fprintf(stderr, "CUDA warning: failed to query device properties: %s\n", cudaGetErrorString(err));
     }
 
-    depth_stride = board_minus + 1;
+    start_offset = tasks[0].start_numrows;
+    for (i = 1; i < task_count; ++i)
+    {
+        if (tasks[i].start_numrows < start_offset)
+        {
+            start_offset = tasks[i].start_numrows;
+        }
+    }
+    if (start_offset < 0)
+    {
+        start_offset = 0;
+    }
+    if (start_offset > board_minus)
+    {
+        start_offset = board_minus;
+    }
+    last_row = board_minus - start_offset;
+    depth_stride = last_row + 1;
     if (depth_stride < 1)
     {
         depth_stride = 1;
@@ -842,7 +864,8 @@ extern "C" int solveTasksGpuCuda(int board_minus,
             {
                 fprintf(stderr, "CUDA warning: autotune H2D copy failed: %s\n", cudaGetErrorString(err));
             }
-            else if (autotuneTargetTasksPerBlock(board_minus,
+            else if (autotuneTargetTasksPerBlock(start_offset,
+                                                 last_row,
                                                  mask,
                                                  depth_stride,
                                                  dyn_shared_bytes,
@@ -941,7 +964,8 @@ extern "C" int solveTasksGpuCuda(int board_minus,
             goto cleanup;
         }
 
-        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE, dyn_shared_bytes, slot->stream>>>(board_minus,
+        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE, dyn_shared_bytes, slot->stream>>>(start_offset,
+                                                                               last_row,
                                                                                mask,
                                                                                depth_stride,
                                                                                slot->d_tasks,
