@@ -24,10 +24,12 @@ typedef unsigned long long BITFIELDTYPE;
 typedef struct
 {
     int start_numrows;
+    int col_0_idx;            /* column index of the queen in row 0 (root of this subtree). */
     BITFIELDTYPE col;
     BITFIELDTYPE pos_diag;
     BITFIELDTYPE neg_diag;
     BITFIELDTYPE bitfield;
+    unsigned char seed_positions[MAX_BOARDSIZE]; /* column of queen in row r, for r in [0, start_numrows). */
 } NqueenTask;
 
 #endif

@@ -187,6 +187,21 @@ int solveTasksGpuCuda(int board_minus,
                       SOLUTIONTYPE* total_out);
 #endif
 
+static int bitFieldIndex(BITFIELDTYPE bit)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(bit);
+#else
+    int idx = 0;
+    while (0 == (bit & (BITFIELDTYPE)1))
+    {
+        bit >>= 1;
+        ++idx;
+    }
+    return idx;
+#endif
+}
+
 static void initTaskList(FrontierTaskList* list)
 {
     list->tasks = NULL;
@@ -220,17 +235,124 @@ static int appendTask(FrontierTaskList* list, const NqueenTask* task)
     return 1;
 }
 
+/*
+ * Compute orbit metrics under the dihedral group D4 for a complete column-vector
+ * solution `positions` on an N x N board.
+ *
+ *   *s_out:  orbit size (number of distinct D4 transforms)
+ *   *q_out:  number of distinct orbit elements that lie in the pruned search
+ *            domain, i.e., col_0 in [0, N/2) AND row_of_col0 >= col_0
+ *
+ * The eight D4 transforms of a column-vector sigma (sigma[r] = column of queen
+ * in row r) are: e, m_v, m_h, r^2, d_main, d_anti, r, r^3, expressed via the
+ * inverse permutation `inv` (inv[c] = row of queen in column c).
+ */
+static void computeOrbitMetricsPruned(const unsigned char* positions,
+                                      int N,
+                                      int* s_out,
+                                      int* q_out)
+{
+    unsigned char transforms[8][MAX_BOARDSIZE];
+    unsigned char inv[MAX_BOARDSIZE];
+    int distinct_idx[8];
+    int distinct_count = 0;
+    int half = N >> 1;
+    int q = 0;
+    int i;
+    int t;
+    int j;
+
+    for (i = 0; i < N; ++i)
+    {
+        inv[positions[i]] = (unsigned char)i;
+    }
+
+    for (i = 0; i < N; ++i)
+    {
+        unsigned char p = positions[i];
+        unsigned char p_rev = positions[N - 1 - i];
+        unsigned char inv_i = inv[i];
+        unsigned char inv_rev = inv[N - 1 - i];
+        transforms[0][i] = p;                                /* e        */
+        transforms[1][i] = (unsigned char)(N - 1 - p);       /* m_v      */
+        transforms[2][i] = p_rev;                            /* m_h      */
+        transforms[3][i] = (unsigned char)(N - 1 - p_rev);   /* r^2      */
+        transforms[4][i] = inv_i;                            /* d_main   */
+        transforms[5][i] = (unsigned char)(N - 1 - inv_rev); /* d_anti   */
+        transforms[6][i] = (unsigned char)(N - 1 - inv_i);   /* r        */
+        transforms[7][i] = inv_rev;                          /* r^3      */
+    }
+
+    for (t = 0; t < 8; ++t)
+    {
+        int is_dup = 0;
+        for (j = 0; j < distinct_count; ++j)
+        {
+            if (0 == memcmp(transforms[t], transforms[distinct_idx[j]], (size_t)N))
+            {
+                is_dup = 1;
+                break;
+            }
+        }
+        if (!is_dup)
+        {
+            distinct_idx[distinct_count++] = t;
+        }
+    }
+
+    for (j = 0; j < distinct_count; ++j)
+    {
+        const unsigned char* p = transforms[distinct_idx[j]];
+        int col_0 = p[0];
+        int row_of_col0 = -1;
+        int in_search_domain = 0;
+
+        if (col_0 < half)
+        {
+            in_search_domain = 1;
+        }
+        else if ((N & 1) && col_0 == half && p[1] < half)
+        {
+            /* Odd-N center-column case: m_v breaks the col_0 = half tie via col_1 < half. */
+            in_search_domain = 1;
+        }
+        if (!in_search_domain)
+        {
+            continue;
+        }
+
+        for (i = 0; i < N; ++i)
+        {
+            if (0 == p[i])
+            {
+                row_of_col0 = i;
+                break;
+            }
+        }
+        if (row_of_col0 >= col_0)
+        {
+            ++q;
+        }
+    }
+
+    *s_out = distinct_count;
+    *q_out = q;
+}
+
 static SOLUTIONTYPE solveTask(int board_minus, BITFIELDTYPE mask, const NqueenTask* task)
 {
     BITFIELDTYPE aQueenBitCol[MAX_BOARDSIZE];
     BITFIELDTYPE aQueenBitPosDiag[MAX_BOARDSIZE];
     BITFIELDTYPE aQueenBitNegDiag[MAX_BOARDSIZE];
     BITFIELDTYPE aStack[MAX_BOARDSIZE + 1];
+    unsigned char positions[MAX_BOARDSIZE];
     BITFIELDTYPE bitfield;
     BITFIELDTYPE lsb;
     int numrows;
     int stack_count;
-    SOLUTIONTYPE solutions = 0;
+    int N = board_minus + 1;
+    int col_0_idx = task->col_0_idx;
+    SOLUTIONTYPE weighted_total = 0;
 
     numrows = task->start_numrows;
     stack_count = 0;
@@ -238,6 +360,7 @@ static SOLUTIONTYPE solveTask(int board_minus, BITFIELDTYPE mask, const NqueenTa
     aQueenBitCol[numrows] = task->col;
     aQueenBitPosDiag[numrows] = task->pos_diag;
     aQueenBitNegDiag[numrows] = task->neg_diag;
+    memcpy(positions, task->seed_positions, sizeof(positions));
 
     for (;;)
     {
@@ -256,6 +379,12 @@ static SOLUTIONTYPE solveTask(int board_minus, BITFIELDTYPE mask, const NqueenTa
         lsb = bitfield & (~bitfield + 1);
         bitfield &= ~lsb;
 
+        /* d_main symmetry-breaking prune: queen in column 0 must be at row >= col_0_idx. */
+        if (1 == lsb && numrows < col_0_idx)
+        {
+            continue;
+        }
+
         if (numrows < board_minus)
         {
             int n = numrows++;
@@ -263,11 +392,36 @@ static SOLUTIONTYPE solveTask(int board_minus, BITFIELDTYPE mask, const NqueenTa
             aQueenBitNegDiag[numrows] = (aQueenBitNegDiag[n] | lsb) >> 1;
             aQueenBitPosDiag[numrows] = (aQueenBitPosDiag[n] | lsb) << 1;
             aStack[stack_count++] = bitfield;
+            positions[n] = (unsigned char)bitFieldIndex(lsb);
             bitfield = mask & ~(aQueenBitCol[numrows] | aQueenBitNegDiag[numrows] | aQueenBitPosDiag[numrows]);
             continue;
         }
 
-        ++solutions;
+        /* leaf reached: queen at row board_minus has been chosen; compute orbit weight */
+        positions[numrows] = (unsigned char)bitFieldIndex(lsb);
+        {
+            int leaf_row_of_col0 = -1;
+            int i;
+            for (i = 0; i < N; ++i)
+            {
+                if (0 == positions[i])
+                {
+                    leaf_row_of_col0 = i;
+                    break;
+                }
+            }
+            if (leaf_row_of_col0 >= col_0_idx)
+            {
+                /* This leaf is in the pruned domain; weight by orbit metrics. */
+                int s;
+                int q;
+                computeOrbitMetricsPruned(positions, N, &s, &q);
+                if (q > 0)
+                {
+                    weighted_total += (SOLUTIONTYPE)((12 * s) / q);
+                }
+            }
+        }
         if (0 == stack_count)
         {
             break;
@@ -276,7 +430,7 @@ static SOLUTIONTYPE solveTask(int board_minus, BITFIELDTYPE mask, const NqueenTa
         --numrows;
     }
 
-    return solutions;
+    return weighted_total;
 }
 
 #ifdef USE_CUDA
@@ -407,6 +561,7 @@ static int generateFrontierFromSeed(int board_minus,
     BITFIELDTYPE aQueenBitPosDiag[MAX_BOARDSIZE];
     BITFIELDTYPE aQueenBitNegDiag[MAX_BOARDSIZE];
     BITFIELDTYPE aStack[MAX_BOARDSIZE + 1];
+    unsigned char positions[MAX_BOARDSIZE];
     BITFIELDTYPE bitfield;
     BITFIELDTYPE lsb;
     int numrows;
@@ -418,6 +573,7 @@ static int generateFrontierFromSeed(int board_minus,
     aQueenBitCol[numrows] = seed->col;
     aQueenBitPosDiag[numrows] = seed->pos_diag;
     aQueenBitNegDiag[numrows] = seed->neg_diag;
+    memcpy(positions, seed->seed_positions, sizeof(positions));
 
     for (;;)
     {
@@ -425,10 +581,12 @@ static int generateFrontierFromSeed(int board_minus,
         {
             NqueenTask task;
             task.start_numrows = numrows;
+            task.col_0_idx = seed->col_0_idx;
             task.col = aQueenBitCol[numrows];
             task.pos_diag = aQueenBitPosDiag[numrows];
             task.neg_diag = aQueenBitNegDiag[numrows];
             task.bitfield = bitfield;
+            memcpy(task.seed_positions, positions, sizeof(task.seed_positions));
 
             if (!appendTask(out, &task))
             {
@@ -458,6 +616,14 @@ static int generateFrontierFromSeed(int board_minus,
         lsb = bitfield & (~bitfield + 1);
         bitfield &= ~lsb;
 
+        /*
+         * NOTE: the d_main symmetry prune is applied at solveTask leaf time, not here,
+         * to keep the emitted frontier compatible with the legacy GPU kernel which
+         * still uses the vertical-mirror-only convention. Once the GPU is migrated
+         * to the orbit-weighted convention, the prune can move up to here for an
+         * additional speedup at the frontier-generation step.
+         */
+
         if (numrows < board_minus)
         {
             int n = numrows++;
@@ -465,6 +631,7 @@ static int generateFrontierFromSeed(int board_minus,
             aQueenBitNegDiag[numrows] = (aQueenBitNegDiag[n] | lsb) >> 1;
             aQueenBitPosDiag[numrows] = (aQueenBitPosDiag[n] | lsb) << 1;
             aStack[stack_count++] = bitfield;
+            positions[n] = (unsigned char)bitFieldIndex(lsb);
             bitfield = mask & ~(aQueenBitCol[numrows] | aQueenBitNegDiag[numrows] | aQueenBitPosDiag[numrows]);
             continue;
         }
@@ -501,10 +668,13 @@ static int generateFrontier(int board_size,
         bitfield &= ~lsb;
 
         seed.start_numrows = 1;
+        seed.col_0_idx = bitFieldIndex(lsb);
         seed.col = lsb;
         seed.neg_diag = (lsb >> 1);
         seed.pos_diag = (lsb << 1);
         seed.bitfield = mask & ~(seed.col | seed.neg_diag | seed.pos_diag);
+        memset(seed.seed_positions, 0, sizeof(seed.seed_positions));
+        seed.seed_positions[0] = (unsigned char)seed.col_0_idx;
 
         if (!generateFrontierFromSeed(board_minus, mask, frontier_depth, &seed, out))
         {
@@ -532,10 +702,14 @@ static int generateFrontier(int board_size,
             pos_diag = ((middle << 1) | lsb) << 1;
 
             seed.start_numrows = 2;
+            seed.col_0_idx = half;  /* row 0's queen sits on the center column for the odd-N branch. */
             seed.col = col;
             seed.neg_diag = neg_diag;
             seed.pos_diag = pos_diag;
             seed.bitfield = mask & ~(col | neg_diag | pos_diag);
+            memset(seed.seed_positions, 0, sizeof(seed.seed_positions));
+            seed.seed_positions[0] = (unsigned char)half;
+            seed.seed_positions[1] = (unsigned char)bitFieldIndex(lsb);
 
             if (!generateFrontierFromSeed(board_minus, mask, frontier_depth, &seed, out))
             {
@@ -756,6 +930,17 @@ void Nqueen(int board_size)
         return;
     }
 
+    /*
+     * `gpu_path_taken` distinguishes the two scaling conventions in flight while the
+     * symmetry-extension Phase 1 lands on CPU first:
+     *   - CPU (this build): solveTasksCpu accumulates 12 * (orbit_size / |orbit ∩ S'|)
+     *     per leaf. Divide by 12 to recover the integer total.
+     *   - GPU: solveTasksGpuCuda still uses the prior vertical-mirror-only convention
+     *     (one count per leaf). Multiply by 2 to recover the total.
+     * When the GPU path is also migrated to the orbit-weighted convention, both
+     * branches will use /12 and this distinction can be removed.
+     */
+    int gpu_path_taken = 0;
 #ifdef USE_CUDA
     int try_gpu = shouldTryGpuSolver(frontier.count);
 
@@ -770,7 +955,7 @@ void Nqueen(int board_size)
     if (try_gpu &&
         solveTasksGpuCuda(board_minus, mask, frontier.tasks, frontier.count, &total))
     {
-        /* GPU result produced successfully. */
+        gpu_path_taken = 1;
     }
     else
     {
@@ -781,8 +966,14 @@ void Nqueen(int board_size)
 #endif
     freeTaskList(&frontier);
 
-    /* multiply solutions by two, to count mirror images */
-    g_numsolutions = total * 2;
+    if (gpu_path_taken)
+    {
+        g_numsolutions = total * 2;
+    }
+    else
+    {
+        g_numsolutions = total / 12;
+    }
 }
 
 /* Print the results at the end of the run */
