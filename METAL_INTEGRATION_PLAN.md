@@ -7,7 +7,7 @@
 Linux/NVIDIA (`-DUSE_CUDA`), or a Metal binary on macOS/Apple Silicon (`-DUSE_METAL`).
 CUDA and Metal are mutually exclusive (enforced with `#error` if both are defined).
 
-Status: **Phases 0 and 1 implemented on branch `metal-backend`; Phase 2 next** · Last updated 2026-11-11
+Status: **Phases 0 and 1 implemented on branch `metal-backend`; Phase 2 partly done (see below)** · Last updated 2026-11-11
 
 Implementation notes (2026-11-11, M1 Max):
 - The history import was done as a plain `git merge --allow-unrelated-histories`
@@ -17,8 +17,23 @@ Implementation notes (2026-11-11, M1 Max):
 - Forced-GPU counts are correct for N = 2..18, and for the Phase 2 edge matrix
   (frontier depths 1/2/6/N−1, `NQ_METAL_MAX_ROWS` 1..23, tiny chunk and batch sizes).
 - N=20 → 39,029,188,884 in 2m38s (standalone nq_metal: 2m37s). N=18 in 2.4 s.
-- Not yet exercised: the GPU-failure retry/exit path (no failure has occurred), a
-  real CUDA build, and the N=21/N=22 long runs.
+- Phase 2 so far:
+  - `make test-metal` added (71 cases, ~48 s). It passed 9 of 10 full runs. Once,
+    N=16 with `NQ_METAL_MAX_ROWS=8` printed a Metal diagnostic and fell back to the
+    CPU; the message was not captured and it did not recur in ~750 further GPU runs.
+    The script now prints any diagnostic. **Open: identify this if it recurs.**
+  - N=21 → 314,666,222,712 in 24m01s (standalone nq_metal: 23m45s, +1.1%).
+  - Failure path, N ≥ 20: `NQ_METAL_MAX_ROWS=15 NQ_METAL_BATCH=16777216 ./nq 20`
+    (one 2.97M-thread dispatch) fails immediately with Internal Error 0000000e, is
+    retried once, then exits 1 with the diagnostic.
+  - Failure path, N < 20: `NQ_METAL_BATCH=16777216 ./nq 19` fails twice, falls back,
+    and the CPU returns the correct count.
+  - The retry-then-recover case could not be provoked and is untested.
+  - **Invariant 2 did not reproduce.** `NQ_METAL_MAX_ROWS=14 ./nq 20` finished
+    correctly in 2m36s, and `NQ_METAL_DISPATCHES_PER_CB=4096 ./nq 20` (~50 s command
+    buffers) also finished correctly. The 13-row default stays until this is
+    re-measured at N=21/22, where threads are heavier.
+- Still to do in Phase 2: N=22 long run, real CUDA build on the NVIDIA box.
 - The built `./nq` binary is no longer tracked; `NQ_METAL_CHUNK` was added as a
   fourth tuning knob, mainly for tests.
 
