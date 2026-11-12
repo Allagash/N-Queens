@@ -1,0 +1,5 @@
+N Queens (Metal) – board size 22
+GPU: Apple M1 Max
+Streaming partial placements to GPU (K=8, chunk=8M, batch=65K)
+[0h01m00s] 64 batches, 4194304 partials dispatched, 2038940125 solutions so far
+GPU error: Internal Error (0000000e:Internal Error)

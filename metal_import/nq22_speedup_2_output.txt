@@ -1,0 +1,4 @@
+GPU error: Discarded (victim of GPU error/recovery) (00000005:kIOGPUCommandBufferCallbackErrorInnocentVictim)
+N Queens (Metal) – board size 22
+GPU: Apple M1 Max
+Streaming partial placements to GPU (K=6, chunk=8000K)

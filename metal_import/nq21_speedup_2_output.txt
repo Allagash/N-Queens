@@ -1,0 +1,7 @@
+N Queens (Metal) – board size 21
+GPU: Apple M1 Max
+Streaming partial placements to GPU (K=6, chunk=8000K)
+  Retry round 1: resuming 449744 checkpointed threads
+  Retry round 2: resuming 183 checkpointed threads
+Calculations took 2484 seconds (0h 41m 24s).
+For board size 21, 314666222712 solutions found.

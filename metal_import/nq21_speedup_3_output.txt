@@ -1,0 +1,4 @@
+GPU error (slot 4): Internal Error (0000000e:Internal Error)
+N Queens (Metal) – board size 21
+GPU: Apple M1 Max
+Streaming partial placements to GPU (K=6, chunk=8000K)
