@@ -4,6 +4,7 @@
 #   make cuda    CUDA backend    (Linux / NVIDIA, needs nvcc)
 #   make metal   Metal backend   (macOS / Apple Silicon, needs full Xcode for
 #                the `metal` shader compiler, not just the Command Line Tools)
+#   make test-metal   build the Metal backend and check its counts (~1 min)
 #
 # Every target writes ./nq. The Metal build also writes nq_metal.metallib,
 # which must stay next to the binary (or be named with NQ_METALLIB=<path>).
@@ -13,7 +14,7 @@ CFLAGS   = -O3 -Wall -Wextra -pthread
 METAL    = xcrun -sdk macosx metal
 METALLIB = xcrun -sdk macosx metallib
 
-.PHONY: cpu cuda metal check-cuda-syntax clean
+.PHONY: cpu cuda metal test-metal check-cuda-syntax clean
 
 cpu:
 	$(CC) $(CFLAGS) nq.c -o nq
@@ -30,6 +31,9 @@ nq_metal.metallib: nq_metal.metal
 metal: nq_metal.metallib
 	clang $(CFLAGS) -DUSE_METAL=1 -fobjc-arc nq.c nq_metal.m \
 	      -framework Metal -framework Foundation -o nq
+
+test-metal: metal
+	./test_metal.sh ./nq
 
 # Checks that nq.c still compiles with the CUDA paths enabled, without nvcc.
 check-cuda-syntax:
