@@ -102,6 +102,19 @@
 
 #include "nq_types.h"
 
+/*
+ * GPU backends. At most one may be compiled in:
+ *   USE_CUDA  - nq_cuda.cu  (Linux / NVIDIA)
+ *   USE_METAL - nq_metal.m  (macOS / Apple Silicon)
+ * Both sit behind the same contract (see solveTasksGpu below).
+ */
+#if defined(USE_CUDA) && defined(USE_METAL)
+#error "USE_CUDA and USE_METAL are mutually exclusive; define at most one."
+#endif
+#if defined(USE_CUDA) || defined(USE_METAL)
+#define NQ_HAVE_GPU 1
+#endif
+
 #define MIN_BOARDSIZE 2
 #define DEFAULT_FRONTIER_DEPTH 6
 #define TASK_BUCKET_POP_RANGE (MAX_BOARDSIZE + 1)
@@ -179,12 +192,27 @@ typedef struct
 } WorkerContext;
 #endif
 
+/*
+ * GPU backend contract: solve every task, store the number of leaves found
+ * (one count per leaf, vertical-mirror-only convention, NOT doubled) in
+ * *total_out and return nonzero. Return 0 to decline, in which case nothing
+ * has been counted and the caller solves all tasks on the CPU.
+ */
 #ifdef USE_CUDA
 int solveTasksGpuCuda(int board_minus,
                       BITFIELDTYPE mask,
                       const NqueenTask* tasks,
                       int task_count,
                       SOLUTIONTYPE* total_out);
+#define solveTasksGpu solveTasksGpuCuda
+#endif
+#ifdef USE_METAL
+int solveTasksGpuMetal(int board_minus,
+                       BITFIELDTYPE mask,
+                       const NqueenTask* tasks,
+                       int task_count,
+                       SOLUTIONTYPE* total_out);
+#define solveTasksGpu solveTasksGpuMetal
 #endif
 
 static int bitFieldIndex(BITFIELDTYPE bit)
@@ -622,6 +650,12 @@ static int generateFrontierFromSeed(int board_minus,
          * still uses the vertical-mirror-only convention. Once the GPU is migrated
          * to the orbit-weighted convention, the prune can move up to here for an
          * additional speedup at the frontier-generation step.
+         *
+         * CONSTRAINT: the Metal backend cannot follow that migration cheaply. Its
+         * kernel counts leaves with popcount leaf peeling and never materializes
+         * per-leaf positions, so it stays on the vertical-mirror-only convention.
+         * If the prune moves up to here, keep a mirror-only frontier mode for
+         * Metal and make the final scaling in Nqueen() per-backend.
          */
 
         if (numrows < board_minus)
@@ -833,7 +867,7 @@ static SOLUTIONTYPE solveTasksCpu(int board_minus,
     return total;
 }
 
-#ifdef USE_CUDA
+#ifdef NQ_HAVE_GPU
 static int getGpuMinTasks(void)
 {
     const char* env = getenv("NQ_GPU_MIN_TASKS");
@@ -870,7 +904,9 @@ static int shouldTryGpuSolver(int task_count)
 
     return task_count >= getGpuMinTasks();
 }
+#endif
 
+#ifdef USE_CUDA
 static int shouldBucketGpuTasks(void)
 {
     const char* value = getenv("NQ_GPU_BUCKET_TASKS");
@@ -936,14 +972,17 @@ void Nqueen(int board_size)
      *   - CPU (this build): solveTasksCpu accumulates 12 * (orbit_size / |orbit ∩ S'|)
      *     per leaf. Divide by 12 to recover the integer total.
      *   - GPU: solveTasksGpuCuda still uses the prior vertical-mirror-only convention
-     *     (one count per leaf). Multiply by 2 to recover the total.
+     *     (one count per leaf). Multiply by 2 to recover the total. solveTasksGpuMetal
+     *     uses the same convention and will keep it (see generateFrontierFromSeed).
      * When the GPU path is also migrated to the orbit-weighted convention, both
      * branches will use /12 and this distinction can be removed.
      */
     int gpu_path_taken = 0;
-#ifdef USE_CUDA
+#ifdef NQ_HAVE_GPU
     int try_gpu = shouldTryGpuSolver(frontier.count);
 
+#ifdef USE_CUDA
+    /* Bucketing is CUDA-only: the Metal backend re-expands tasks, so order is irrelevant. */
     if (try_gpu && shouldBucketGpuTasks())
     {
         if (!bucketFrontierTasks(&frontier, board_minus))
@@ -951,9 +990,10 @@ void Nqueen(int board_size)
             fprintf(stderr, "Warning: failed to bucket GPU tasks; continuing without bucketing.\n");
         }
     }
+#endif
 
     if (try_gpu &&
-        solveTasksGpuCuda(board_minus, mask, frontier.tasks, frontier.count, &total))
+        solveTasksGpu(board_minus, mask, frontier.tasks, frontier.count, &total))
     {
         gpu_path_taken = 1;
     }

@@ -1,0 +1,11 @@
+# Build outputs
+/nq
+/nq_cpu
+/nq_cpu_check
+/nq_mt
+/nq_mt2
+/nq_optim
+*.o
+*.air
+*.metallib
+.DS_Store
