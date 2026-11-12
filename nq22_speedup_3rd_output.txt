@@ -1,0 +1,5 @@
+N Queens (Metal) – board size 22
+GPU: Apple M1 Max
+Streaming partial placements to GPU (K=6, chunk=8000K)
+Calculations took 25724 seconds (7h 8m 44s).
+For board size 22, 2691008701644 solutions found.
