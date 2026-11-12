@@ -33,7 +33,19 @@ Implementation notes (2026-11-11, M1 Max):
     correctly in 2m36s, and `NQ_METAL_DISPATCHES_PER_CB=4096 ./nq 20` (~50 s command
     buffers) also finished correctly. The 13-row default stays until this is
     re-measured at N=21/22, where threads are heavier.
-- Still to do in Phase 2: N=22 long run, real CUDA build on the NVIDIA box.
+  - N=22 → 2,691,008,701,644 in 3h55m14s (standalone nq_metal: 3h50m, +2.3%), run
+    2026-11-12. About 6–7 minutes in, two command buffers failed with Internal Error
+    0000000e at the default settings (13 rows, 65536 threads, 16 dispatches). Both
+    were recovered by the retry on a fresh queue and the final count is correct, so
+    the retry-then-recover path is now exercised by a real failure. Standalone
+    nq_metal would have exited at that point.
+  - This is the likely explanation for the one-off test failure above: the script at
+    that time reported any "Metal:" line as a fallback, including a recovered retry.
+    Not proven, since that message was not captured.
+  - Consequence: transient command-buffer failures happen at the validated settings,
+    so the retry is load-bearing, not a safety net. The cause of the transient
+    errors is unknown.
+- Still to do in Phase 2: real CUDA build on the NVIDIA box.
 - The built `./nq` binary is no longer tracked; `NQ_METAL_CHUNK` was added as a
   fourth tuning knob, mainly for tests.
 
