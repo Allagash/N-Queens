@@ -1,13 +1,29 @@
 # Can the NVIDIA (RTX 4060) build be made meaningfully faster?
 
-Status: **Step 1 implemented on branch `cuda-peel`, awaiting measurement on the
-NVIDIA box** (`./bench_cuda_kernels.sh` after `make cuda`) · 2026-11-13
+Status: **Gate passed once the block count was raised; Step 2 (tuning) in
+progress.** `legacy` is still the default · 2026-11-13
 
-Step 1 as built: `nq_peel.h` (solver), `test_peel.c` + `make test-peel` (host test,
-97 cases, passes), `NQ_GPU_KERNEL=peel` in `nq_cuda.cu` (default still `legacy`).
-Per-thread shared memory in peel mode is 16 B x (rows - 5): 128 B at N=19 versus
-416 B. The CUDA source could only be type-checked against a stub header on the Mac;
-it has not been compiled by `nvcc` or run on a GPU yet.
+Measured on the RTX 4060 (kernel+reduce, all counts correct):
+
+| N  | legacy, default (62 blocks) | peel, default (62 blocks) | peel, 144 blocks | peel, 288 blocks |
+|----|-----------------------------|---------------------------|------------------|------------------|
+| 18 | 4.91 s                      | 4.36 s                    |                  |                  |
+| 19 | 30.6 s                      | 34.3 s                    | 16.2 s           | 12.1 s (2.5x)    |
+| 20 | 244.0 s                     | 269.2 s                   |                  |                  |
+
+At the default block count `peel` is about 10% slower than `legacy`, so the gain
+does not come from peeling making each thread faster. It comes from the smaller
+per-thread state (8 KB of shared memory per block instead of 26.6 KB) letting four
+times as many blocks run at once. `NQ_GPU_PERSIST_BLOCKS` sets the block count.
+Not yet measured: `legacy` with more blocks (expected to gain little, since shared
+memory already limits it to about 3 blocks per SM).
+
+Step 2 so far: `NQ_GPU_KERNEL=peel-local` keeps the frames in thread-local memory
+(no shared-memory limit on blocks per SM); `tune_cuda_peel.sh` sweeps block count,
+peel vs peel-local, pipeline slots and frontier depth 7. `peel-local` has not been
+compiled by `nvcc` yet. Also fixed: an `NQ_GPU_PERSIST_BLOCKS` override above the
+partial-sum buffer size (977 blocks for a 500k batch) would have overrun it; it is
+now clamped.
 
 ## Context
 

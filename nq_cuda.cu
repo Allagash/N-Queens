@@ -16,12 +16,14 @@
 #define MAX_GPU_PIPELINE_SLOTS 2
 
 /*
- * Two interchangeable subtree solvers (NQ_GPU_KERNEL=legacy|peel):
+ * Interchangeable subtree solvers (NQ_GPU_KERNEL=legacy|peel|peel-local):
  *   legacy  solveTaskDevice below: 64-bit masks, all DFS state in shared memory,
  *           one leaf counted per iteration.
  *   peel    nqPeelSolve from nq_peel.h: 32-bit masks, state in registers, last
  *           four rows peeled with a popcount at the bottom. Needs less shared
  *           memory per thread (one 16-byte frame per stacked row).
+ *   peel-local  the same solver with its frames in thread-local memory, so
+ *           shared memory no longer limits how many blocks fit on an SM.
  */
 #define NQ_PEEL_FN static __device__ __forceinline__
 #define NQ_PEEL_POPCOUNT(x) __popc(x)
@@ -29,6 +31,7 @@
 
 #define GPU_KERNEL_LEGACY 0
 #define GPU_KERNEL_PEEL 1
+#define GPU_KERNEL_PEEL_LOCAL 2
 
 static __device__ SOLUTIONTYPE solveTaskDevice(int start_offset,
                                                int last_row,
@@ -96,6 +99,7 @@ static __device__ SOLUTIONTYPE solveTaskDevice(int start_offset,
  * region, in units that depend on kernel_mode:
  *   legacy: 4 arrays of depth_stride 64-bit words (32 * depth_stride bytes)
  *   peel:   depth_stride NqPeelFrame entries       (16 * depth_stride bytes)
+ *   peel-local: nothing (frames are a local array in the kernel)
  * getKernelDepthStride()/getKernelSharedBytes() below are the single source
  * of truth for both.
  */
@@ -114,9 +118,12 @@ static __global__ void solveTasksKernel(int kernel_mode,
 
     SOLUTIONTYPE local = 0;
 
-    if (GPU_KERNEL_PEEL == kernel_mode)
+    if (GPU_KERNEL_LEGACY != kernel_mode)
     {
-        NqPeelFrame* stk = (NqPeelFrame*)s_dyn + (size_t)threadIdx.x * depth_stride;
+        NqPeelFrame local_stk[NQ_PEEL_STACK_FRAMES(NQ_PEEL_MAX_BOARD)];
+        NqPeelFrame* stk = (GPU_KERNEL_PEEL_LOCAL == kernel_mode)
+            ? local_stk
+            : (NqPeelFrame*)s_dyn + (size_t)threadIdx.x * depth_stride;
         const uint32_t mask32 = (uint32_t)mask;
         const uint32_t board_minus = (uint32_t)(last_row + start_offset);
 
@@ -206,18 +213,18 @@ static __global__ void reduceSumsKernel(const SOLUTIONTYPE* in_values,
     }
 }
 
-/* NQ_GPU_KERNEL=peel selects the peeled kernel; anything else is legacy. */
+/* NQ_GPU_KERNEL=peel or peel-local selects a peeled kernel; anything else is legacy. */
 static int getGpuKernelMode(int board_size)
 {
     const char* value = getenv("NQ_GPU_KERNEL");
 
-    if (value != NULL && 0 == strcmp(value, "peel"))
+    if (value != NULL && (0 == strcmp(value, "peel") || 0 == strcmp(value, "peel-local")))
     {
         if (board_size <= NQ_PEEL_MAX_BOARD)
         {
-            return GPU_KERNEL_PEEL;
+            return (0 == strcmp(value, "peel")) ? GPU_KERNEL_PEEL : GPU_KERNEL_PEEL_LOCAL;
         }
-        fprintf(stderr, "CUDA warning: NQ_GPU_KERNEL=peel supports boards up to %d; using legacy kernel.\n",
+        fprintf(stderr, "CUDA warning: the peel kernels support boards up to %d; using legacy kernel.\n",
                 NQ_PEEL_MAX_BOARD);
     }
     return GPU_KERNEL_LEGACY;
@@ -226,13 +233,19 @@ static int getGpuKernelMode(int board_size)
 /* max_rows = most rows any task still has to fill (board_size - smallest start row). */
 static int getKernelDepthStride(int kernel_mode, int max_rows)
 {
-    int stride = (GPU_KERNEL_PEEL == kernel_mode) ? NQ_PEEL_STACK_FRAMES(max_rows) : max_rows;
+    int stride = (GPU_KERNEL_LEGACY != kernel_mode) ? NQ_PEEL_STACK_FRAMES(max_rows) : max_rows;
     return (stride < 1) ? 1 : stride;
 }
 
 static size_t getKernelSharedBytes(int kernel_mode, int depth_stride)
 {
-    size_t per_thread = (GPU_KERNEL_PEEL == kernel_mode)
+    size_t per_thread;
+
+    if (GPU_KERNEL_PEEL_LOCAL == kernel_mode)
+    {
+        return 0;
+    }
+    per_thread = (GPU_KERNEL_PEEL == kernel_mode)
         ? sizeof(NqPeelFrame) * (size_t)depth_stride
         : (size_t)4 * sizeof(BITFIELDTYPE) * (size_t)depth_stride;
     return per_thread * (size_t)CUDA_BLOCK_SIZE;
@@ -1008,6 +1021,12 @@ extern "C" int solveTasksGpuCuda(int board_minus,
         {
             launch_blocks = 1;
         }
+        if (launch_blocks > max_launch_blocks)
+        {
+            /* d_partial_* hold max_launch_blocks sums; an NQ_GPU_PERSIST_BLOCKS
+               override must not run past them. */
+            launch_blocks = max_launch_blocks;
+        }
         if (launch_blocks > max_blocks_used)
         {
             max_blocks_used = launch_blocks;
@@ -1149,7 +1168,7 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     {
         fprintf(stderr,
                 "GPU timing (ms): kernel=%s smem_per_block=%zu H2D=%.3f kernel+reduce=%.3f D2H=%.3f tasks=%d batch_tasks=%d batches=%d pipeline_slots=%d max_blocks=%d target_tasks_per_block=%d persist_override=%d autotune_target=%d autotune_blocks=%d autotune_ms=%.3f total_passes=%d max_passes=%d\n",
-                (GPU_KERNEL_PEEL == kernel_mode) ? "peel" : "legacy",
+                (GPU_KERNEL_PEEL == kernel_mode) ? "peel" : (GPU_KERNEL_PEEL_LOCAL == kernel_mode) ? "peel-local" : "legacy",
                 dyn_shared_bytes,
                 h2d_total_ms,
                 kernel_total_ms,
