@@ -77,10 +77,10 @@ Run-time options specific to the CUDA build:
 - auto-tune sample tasks (default 8192; use larger values like 65536+ on larger GPUs): `NQ_GPU_AUTOTUNE_SAMPLE_TASKS=16384 ./nq 19`
 - GPU pipeline slots for overlapped batch execution (default 2, max 2): `NQ_GPU_PIPELINE_SLOTS=1 ./nq 19`
 - GPU task bucketing (default off, opt-in): `NQ_GPU_BUCKET_TASKS=1 ./nq 19`
-- subtree kernel (default `legacy`; `peel` and `peel-local` are experimental and
-  only pay off with more blocks, 2.5x at N=19 on an RTX 4060; see
-  `CUDA_PEEL_PLAN.md` and `tune_cuda_peel.sh`):
-  `NQ_GPU_KERNEL=peel NQ_GPU_PERSIST_BLOCKS=288 ./nq 19`
+- subtree kernel: `peel` is the default for boards up to 31 (2.3-2.5x faster than
+  `legacy` at N=19/20 on an RTX 4060, see `CUDA_PEEL_PLAN.md`); it picks its own
+  block count to fill the GPU unless `NQ_GPU_PERSIST_BLOCKS` is set. The old
+  kernel: `NQ_GPU_KERNEL=legacy ./nq 19`
 
 Mode benchmark harness (CPU vs GPU vs auto, CSV output):
 - `./bench_modes.sh --ns "16 17 18 19 20" --repeats 3 --gpu-batch 500000 --frontier-depth 6`

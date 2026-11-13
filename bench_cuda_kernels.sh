@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Compare the two CUDA subtree kernels (NQ_GPU_KERNEL=legacy|peel) on the
-# NVIDIA box: correctness first, then timing.
+# Compare the two CUDA subtree kernels (NQ_GPU_KERNEL=peel|legacy, peel is the
+# default) on the NVIDIA box at default settings: correctness first, then timing.
 #
 # Usage: ./bench_cuda_kernels.sh [--with-n20] [path-to-nq]
 #   Build first with `make cuda`. Default binary is ./nq.

@@ -1,29 +1,45 @@
 # Can the NVIDIA (RTX 4060) build be made meaningfully faster?
 
-Status: **Gate passed once the block count was raised; Step 2 (tuning) in
-progress.** `legacy` is still the default · 2026-11-13
+Status: **Done except for a final confirmation run.** `peel` is now the default
+CUDA kernel; the automatic block count has not been built by `nvcc` yet · 2026-11-13
 
-Measured on the RTX 4060 (kernel+reduce, all counts correct):
+Outcome on the RTX 4060 (kernel+reduce, all counts correct): **N=19 31.0 s → 12.5 s
+(2.5x), N=20 244 s → 107 s (2.3x)**, inside the 2–4x estimate below but not for the
+reason given there.
 
-| N  | legacy, default (62 blocks) | peel, default (62 blocks) | peel, 144 blocks | peel, 288 blocks |
-|----|-----------------------------|---------------------------|------------------|------------------|
-| 18 | 4.91 s                      | 4.36 s                    |                  |                  |
-| 19 | 30.6 s                      | 34.3 s                    | 16.2 s           | 12.1 s (2.5x)    |
-| 20 | 244.0 s                     | 269.2 s                   |                  |                  |
+| Setting                         | N=18   | N=19   | N=20   |
+|---------------------------------|--------|--------|--------|
+| legacy, 62 blocks (old default) | 4.91 s | 31.0 s | 244 s  |
+| legacy, 144 blocks              |        | 25.6 s |        |
+| peel, 62 blocks                 | 4.36 s | 34.3 s | 269 s  |
+| peel, 144 blocks                |        | 16.2 s |        |
+| **peel, 288 blocks**            |        | **12.5 s** | **107 s** |
+| peel, 576 blocks                |        | 12.5 s |        |
+| peel-local, 288 blocks          |        | 15.5 s |        |
+| peel-local, 576 blocks          |        | 16.3 s | 147 s  |
 
-At the default block count `peel` is about 10% slower than `legacy`, so the gain
-does not come from peeling making each thread faster. It comes from the smaller
-per-thread state (8 KB of shared memory per block instead of 26.6 KB) letting four
-times as many blocks run at once. `NQ_GPU_PERSIST_BLOCKS` sets the block count.
-Not yet measured: `legacy` with more blocks (expected to gain little, since shared
-memory already limits it to about 3 blocks per SM).
+What the measurements say:
 
-Step 2 so far: `NQ_GPU_KERNEL=peel-local` keeps the frames in thread-local memory
-(no shared-memory limit on blocks per SM); `tune_cuda_peel.sh` sweeps block count,
-peel vs peel-local, pipeline slots and frontier depth 7. `peel-local` has not been
-compiled by `nvcc` yet. Also fixed: an `NQ_GPU_PERSIST_BLOCKS` override above the
-partial-sum buffer size (977 blocks for a 500k batch) would have overrun it; it is
-now clamped.
+- At an equal block count `peel` is about 10% slower than `legacy`, so peeling did
+  not make each thread faster on this GPU (cause not established; warp divergence
+  in the nested peel loops is the guess). The gain comes from the smaller per-thread
+  state: 8 KB of shared memory per block instead of 26.6 KB lets about four times
+  as many blocks run at once.
+- 288 blocks is the ceiling (about 12 per SM on 24 SMs); 576 adds nothing.
+- `peel-local` (frames in thread-local memory, removed again) was 25–40% slower.
+- One pipeline slot versus two: no difference (12.6 s vs 12.5 s).
+- Frontier depth 7 versus 6: no real difference (12.4 vs 12.6 s at N=19, 106.0 vs
+  106.9 s at N=20). Depth 6 stays.
+
+As shipped: `peel` is the default for boards up to 31 (`NQ_GPU_KERNEL=legacy`
+selects the old kernel), and it launches enough blocks to fill each SM's shared
+memory (`getSmFillBlocks` in `nq_cuda.cu`; about 264 blocks at N=19 on the 4060)
+unless `NQ_GPU_PERSIST_BLOCKS` or autotune is set. Also fixed: an
+`NQ_GPU_PERSIST_BLOCKS` override larger than the partial-sum buffer is clamped.
+
+Not done: an `ncu` profile of the peel kernel (verification item 4 below).
+
+The rest of this file is the plan as approved, kept for the record.
 
 ## Context
 

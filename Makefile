@@ -5,8 +5,8 @@
 #   make metal   Metal backend   (macOS / Apple Silicon, needs full Xcode for
 #                the `metal` shader compiler, not just the Command Line Tools)
 #   make test-metal   build the Metal backend and check its counts (~1 min)
-#   (CUDA box: bench_cuda_kernels.sh, tune_cuda_peel.sh compare the kernels)
-#   make test-peel    host test of nq_peel.h, the solver behind NQ_GPU_KERNEL=peel
+#   (CUDA box: bench_cuda_kernels.sh compares the peel and legacy kernels)
+#   make test-peel    host test of nq_peel.h, the solver in the default CUDA kernel
 #                     (runs anywhere; no GPU needed)
 #
 # Every target writes ./nq. The Metal build also writes nq_metal.metallib,
