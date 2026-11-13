@@ -15,6 +15,21 @@
 #define DEFAULT_GPU_PIPELINE_SLOTS 2
 #define MAX_GPU_PIPELINE_SLOTS 2
 
+/*
+ * Two interchangeable subtree solvers (NQ_GPU_KERNEL=legacy|peel):
+ *   legacy  solveTaskDevice below: 64-bit masks, all DFS state in shared memory,
+ *           one leaf counted per iteration.
+ *   peel    nqPeelSolve from nq_peel.h: 32-bit masks, state in registers, last
+ *           four rows peeled with a popcount at the bottom. Needs less shared
+ *           memory per thread (one 16-byte frame per stacked row).
+ */
+#define NQ_PEEL_FN static __device__ __forceinline__
+#define NQ_PEEL_POPCOUNT(x) __popc(x)
+#include "nq_peel.h"
+
+#define GPU_KERNEL_LEGACY 0
+#define GPU_KERNEL_PEEL 1
+
 static __device__ SOLUTIONTYPE solveTaskDevice(int start_offset,
                                                int last_row,
                                                BITFIELDTYPE mask,
@@ -76,7 +91,16 @@ static __device__ SOLUTIONTYPE solveTaskDevice(int start_offset,
     return solutions;
 }
 
-static __global__ void solveTasksKernel(int start_offset,
+/*
+ * depth_stride is the per-thread slot count in the dynamic shared-memory
+ * region, in units that depend on kernel_mode:
+ *   legacy: 4 arrays of depth_stride 64-bit words (32 * depth_stride bytes)
+ *   peel:   depth_stride NqPeelFrame entries       (16 * depth_stride bytes)
+ * getKernelDepthStride()/getKernelSharedBytes() below are the single source
+ * of truth for both.
+ */
+static __global__ void solveTasksKernel(int kernel_mode,
+                                        int start_offset,
                                         int last_row,
                                         BITFIELDTYPE mask,
                                         int depth_stride,
@@ -88,22 +112,50 @@ static __global__ void solveTasksKernel(int start_offset,
     extern __shared__ unsigned long long s_dyn[];
     __shared__ SOLUTIONTYPE shared_sums[CUDA_BLOCK_SIZE];
 
-    BITFIELDTYPE* s_thread = (BITFIELDTYPE*)s_dyn + (size_t)threadIdx.x * 4 * depth_stride;
-    BITFIELDTYPE* s_col   = s_thread;
-    BITFIELDTYPE* s_pos   = s_thread + depth_stride;
-    BITFIELDTYPE* s_neg   = s_thread + 2 * depth_stride;
-    BITFIELDTYPE* s_stack = s_thread + 3 * depth_stride;
-
     SOLUTIONTYPE local = 0;
 
-    for (;;)
+    if (GPU_KERNEL_PEEL == kernel_mode)
     {
-        unsigned int idx = atomicAdd(next_task, 1u);
-        if (idx >= (unsigned int)task_count)
+        NqPeelFrame* stk = (NqPeelFrame*)s_dyn + (size_t)threadIdx.x * depth_stride;
+        const uint32_t mask32 = (uint32_t)mask;
+        const uint32_t board_minus = (uint32_t)(last_row + start_offset);
+
+        for (;;)
         {
-            break;
+            unsigned int idx = atomicAdd(next_task, 1u);
+            if (idx >= (unsigned int)task_count)
+            {
+                break;
+            }
+            /* Narrowing to 32 bits is exact: only pos_diag bits already shifted
+               past the board are dropped, and they can never shift back. */
+            local += nqPeelSolve(mask32,
+                                 board_minus,
+                                 (uint32_t)tasks[idx].start_numrows,
+                                 (uint32_t)tasks[idx].col,
+                                 (uint32_t)tasks[idx].pos_diag,
+                                 (uint32_t)tasks[idx].neg_diag,
+                                 (uint32_t)tasks[idx].bitfield,
+                                 stk);
         }
-        local += solveTaskDevice(start_offset, last_row, mask, s_col, s_pos, s_neg, s_stack, tasks[idx]);
+    }
+    else
+    {
+        BITFIELDTYPE* s_thread = (BITFIELDTYPE*)s_dyn + (size_t)threadIdx.x * 4 * depth_stride;
+        BITFIELDTYPE* s_col   = s_thread;
+        BITFIELDTYPE* s_pos   = s_thread + depth_stride;
+        BITFIELDTYPE* s_neg   = s_thread + 2 * depth_stride;
+        BITFIELDTYPE* s_stack = s_thread + 3 * depth_stride;
+
+        for (;;)
+        {
+            unsigned int idx = atomicAdd(next_task, 1u);
+            if (idx >= (unsigned int)task_count)
+            {
+                break;
+            }
+            local += solveTaskDevice(start_offset, last_row, mask, s_col, s_pos, s_neg, s_stack, tasks[idx]);
+        }
     }
 
     shared_sums[threadIdx.x] = local;
@@ -152,6 +204,38 @@ static __global__ void reduceSumsKernel(const SOLUTIONTYPE* in_values,
     {
         out_values[blockIdx.x] = shared_sums[0];
     }
+}
+
+/* NQ_GPU_KERNEL=peel selects the peeled kernel; anything else is legacy. */
+static int getGpuKernelMode(int board_size)
+{
+    const char* value = getenv("NQ_GPU_KERNEL");
+
+    if (value != NULL && 0 == strcmp(value, "peel"))
+    {
+        if (board_size <= NQ_PEEL_MAX_BOARD)
+        {
+            return GPU_KERNEL_PEEL;
+        }
+        fprintf(stderr, "CUDA warning: NQ_GPU_KERNEL=peel supports boards up to %d; using legacy kernel.\n",
+                NQ_PEEL_MAX_BOARD);
+    }
+    return GPU_KERNEL_LEGACY;
+}
+
+/* max_rows = most rows any task still has to fill (board_size - smallest start row). */
+static int getKernelDepthStride(int kernel_mode, int max_rows)
+{
+    int stride = (GPU_KERNEL_PEEL == kernel_mode) ? NQ_PEEL_STACK_FRAMES(max_rows) : max_rows;
+    return (stride < 1) ? 1 : stride;
+}
+
+static size_t getKernelSharedBytes(int kernel_mode, int depth_stride)
+{
+    size_t per_thread = (GPU_KERNEL_PEEL == kernel_mode)
+        ? sizeof(NqPeelFrame) * (size_t)depth_stride
+        : (size_t)4 * sizeof(BITFIELDTYPE) * (size_t)depth_stride;
+    return per_thread * (size_t)CUDA_BLOCK_SIZE;
 }
 
 static int shouldPrintGpuTiming(void)
@@ -493,7 +577,8 @@ static int shouldRunAutotuneSample(int sample_max_blocks, int baseline_blocks)
     return 1;
 }
 
-static int autotuneTargetTasksPerBlock(int start_offset,
+static int autotuneTargetTasksPerBlock(int kernel_mode,
+                                       int start_offset,
                                        int last_row,
                                        BITFIELDTYPE mask,
                                        int depth_stride,
@@ -571,7 +656,7 @@ static int autotuneTargetTasksPerBlock(int start_offset,
         }
 
         cudaEventRecord(ev_start, 0);
-        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE, dyn_shared_bytes>>>(start_offset, last_row, mask, depth_stride, d_tasks, sample_tasks, d_next_task, d_partial_a);
+        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE, dyn_shared_bytes>>>(kernel_mode, start_offset, last_row, mask, depth_stride, d_tasks, sample_tasks, d_next_task, d_partial_a);
         err = cudaGetLastError();
         if (cudaSuccess != err)
         {
@@ -648,6 +733,7 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     int depth_stride;
     int start_offset;
     int last_row;
+    int kernel_mode = getGpuKernelMode(board_minus + 1);
     size_t dyn_shared_bytes;
 
     memset(slots, 0, sizeof(slots));
@@ -691,12 +777,8 @@ extern "C" int solveTasksGpuCuda(int board_minus,
         start_offset = board_minus;
     }
     last_row = board_minus - start_offset;
-    depth_stride = last_row + 1;
-    if (depth_stride < 1)
-    {
-        depth_stride = 1;
-    }
-    dyn_shared_bytes = (size_t)4 * sizeof(BITFIELDTYPE) * (size_t)depth_stride * (size_t)CUDA_BLOCK_SIZE;
+    depth_stride = getKernelDepthStride(kernel_mode, last_row + 1);
+    dyn_shared_bytes = getKernelSharedBytes(kernel_mode, depth_stride);
 
     if (dyn_shared_bytes > (size_t)GPU_KERNEL_DEFAULT_SMEM_LIMIT)
     {
@@ -864,7 +946,8 @@ extern "C" int solveTasksGpuCuda(int board_minus,
             {
                 fprintf(stderr, "CUDA warning: autotune H2D copy failed: %s\n", cudaGetErrorString(err));
             }
-            else if (autotuneTargetTasksPerBlock(start_offset,
+            else if (autotuneTargetTasksPerBlock(kernel_mode,
+                                                 start_offset,
                                                  last_row,
                                                  mask,
                                                  depth_stride,
@@ -964,7 +1047,8 @@ extern "C" int solveTasksGpuCuda(int board_minus,
             goto cleanup;
         }
 
-        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE, dyn_shared_bytes, slot->stream>>>(start_offset,
+        solveTasksKernel<<<launch_blocks, CUDA_BLOCK_SIZE, dyn_shared_bytes, slot->stream>>>(kernel_mode,
+                                                                               start_offset,
                                                                                last_row,
                                                                                mask,
                                                                                depth_stride,
@@ -1064,7 +1148,9 @@ extern "C" int solveTasksGpuCuda(int board_minus,
     if (print_timing)
     {
         fprintf(stderr,
-                "GPU timing (ms): H2D=%.3f kernel+reduce=%.3f D2H=%.3f tasks=%d batch_tasks=%d batches=%d pipeline_slots=%d max_blocks=%d target_tasks_per_block=%d persist_override=%d autotune_target=%d autotune_blocks=%d autotune_ms=%.3f total_passes=%d max_passes=%d\n",
+                "GPU timing (ms): kernel=%s smem_per_block=%zu H2D=%.3f kernel+reduce=%.3f D2H=%.3f tasks=%d batch_tasks=%d batches=%d pipeline_slots=%d max_blocks=%d target_tasks_per_block=%d persist_override=%d autotune_target=%d autotune_blocks=%d autotune_ms=%.3f total_passes=%d max_passes=%d\n",
+                (GPU_KERNEL_PEEL == kernel_mode) ? "peel" : "legacy",
+                dyn_shared_bytes,
                 h2d_total_ms,
                 kernel_total_ms,
                 d2h_total_ms,

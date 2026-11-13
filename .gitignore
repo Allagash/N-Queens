@@ -5,6 +5,7 @@
 /nq_mt
 /nq_mt2
 /nq_optim
+/test_peel
 *.o
 *.air
 *.metallib
