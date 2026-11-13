@@ -868,10 +868,22 @@ static SOLUTIONTYPE solveTasksCpu(int board_minus,
 }
 
 #ifdef NQ_HAVE_GPU
+/*
+ * Auto mode uses the GPU when the frontier has at least this many tasks.
+ * Measured crossovers at frontier depth 6:
+ *   CUDA  (RTX 4060): GPU wins from N=17 (724,001 tasks); N=16 has 419,408.
+ *   Metal (M1 Max):   GPU wins from N=15 (231,519 tasks); N=14 has 120,742.
+ */
+#ifdef USE_METAL
+#define DEFAULT_GPU_MIN_TASKS 200000
+#else
+#define DEFAULT_GPU_MIN_TASKS 600000
+#endif
+
 static int getGpuMinTasks(void)
 {
     const char* env = getenv("NQ_GPU_MIN_TASKS");
-    int min_tasks = 600000;
+    int min_tasks = DEFAULT_GPU_MIN_TASKS;
 
     if (env != NULL && *env != '\0')
     {

@@ -43,6 +43,8 @@
  *   NQ_METAL_CHUNK               partials buffered per flush  (default 8000000)
  *   NQ_METALLIB                  path to nq_metal.metallib    (default: next
  *                                to the executable)
+ * NQ_GPU_TIMING=1 prints a one-line summary (device, depth, time split,
+ * retries) on stderr, as it does for the CUDA backend.
  */
 
 #import <Foundation/Foundation.h>
@@ -103,10 +105,16 @@ typedef struct {
     uint64_t                    total;         /* leaves counted so far */
     int                         failed;        /* set on unrecoverable GPU error */
 
-    /* progress */
-    int                         task_index;    /* shallow task being expanded */
+    /* progress and statistics */
+    int                         task_index;      /* frontier task being expanded */
+    int                         tasks_completed; /* frontier tasks fully solved on the GPU */
     int                         task_count;
-    int64_t                     partials_done;
+    int64_t                     partials_done;   /* GPU threads completed */
+    int64_t                     chunks;
+    int64_t                     command_buffers;
+    int                         retries;         /* command buffers that failed and were retried */
+    double                      gpu_seconds;     /* time spent waiting on command buffers */
+    int                         printed_header;
     time_t                      start_time;
     time_t                      last_progress;
 } MetalCtx;
@@ -143,18 +151,52 @@ static NSString* metallibPath(void)
                stringByAppendingPathComponent:@"nq_metal.metallib"];
 }
 
-static void printProgress(MetalCtx* c)
+static double nowSeconds(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static int envFlag(const char* name)
+{
+    const char* value = getenv(name);
+    return value != NULL &&
+           (0 == strcmp(value, "1") || 0 == strcmp(value, "true") || 0 == strcmp(value, "TRUE") ||
+            0 == strcmp(value, "on") || 0 == strcmp(value, "ON"));
+}
+
+/*
+ * Progress line, at most once a minute. The percentage is GPU work actually
+ * completed, in units of frontier tasks: tasks finished in earlier chunks plus
+ * the solved fraction of the chunk in flight (chunk_done of chunk_total
+ * partials). Tasks differ in size, so it is an estimate, but it never runs
+ * ahead of the GPU.
+ */
+static void printProgress(MetalCtx* c, int64_t chunk_done, int64_t chunk_total)
 {
     time_t now;
     time(&now);
     if (difftime(now, c->last_progress) < 60.0) return;
     c->last_progress = now;
 
-    int secs = (int)difftime(now, c->start_time);
-    double pct = c->task_count > 0 ? 100.0 * (double)c->task_index / (double)c->task_count : 0.0;
+    if (!c->printed_header) {
+        c->printed_header = 1;
+        fprintf(stderr, "GPU: %s (Metal), board size %d, CPU expands the frontier to row %d, %d rows per GPU thread\n",
+                [[c->device name] UTF8String], c->board_size, c->target_depth,
+                c->board_size - c->target_depth);
+    }
 
-    fprintf(stderr, "[%dh%02dm%02ds] %.1f%% of %d frontier tasks, %lld GPU threads run, %llu leaves counted\n",
-            secs / 3600, (secs % 3600) / 60, secs % 60, pct, c->task_count,
+    int    secs     = (int)difftime(now, c->start_time);
+    double in_chunk = chunk_total > 0
+        ? (double)(c->task_index - c->tasks_completed) * (double)chunk_done / (double)chunk_total
+        : 0.0;
+    double pct = c->task_count > 0
+        ? 100.0 * ((double)c->tasks_completed + in_chunk) / (double)c->task_count
+        : 0.0;
+
+    fprintf(stderr, "[%dh%02dm%02ds] %.1f%% done, %lld GPU threads run, %llu leaves counted\n",
+            secs / 3600, (secs % 3600) / 60, secs % 60, pct,
             (long long)c->partials_done, (unsigned long long)c->total);
 }
 
@@ -187,8 +229,11 @@ static int runCommandBuffer(MetalCtx* c, int64_t first_batch, int count,
                  threadsPerThreadgroup:MTLSizeMake(c->tgSize, 1, 1)];
         }
         [enc endEncoding];
+        double t0 = nowSeconds();
         [cb commit];
         [cb waitUntilCompleted];   /* invariant 1: never queue a second CB behind this one */
+        c->gpu_seconds += nowSeconds() - t0;
+        c->command_buffers++;
 
         if (cb.status != MTLCommandBufferStatusCompleted) {
             const char* text = [cb.error.localizedDescription UTF8String];
@@ -226,6 +271,7 @@ static void flushToGpu(MetalCtx* c)
             /* Retry once: fresh queue (the old one may be poisoned), one
                dispatch per command buffer. */
             fprintf(stderr, "Metal: command buffer failed (%s); retrying on a fresh queue.\n", err);
+            c->retries++;
             c->queue = [c->device newCommandQueue];
             memset(results + first, 0, (size_t)(last - first) * sizeof(uint64_t));
 
@@ -251,9 +297,12 @@ static void flushToGpu(MetalCtx* c)
         for (int64_t i = first; i < last; i++) c->total += results[i];
         c->partials_done += last - first;
         bidx += count;
-        printProgress(c);
+        printProgress(c, last, num);
     }
 
+    /* Every task before the one being expanded is now completely solved. */
+    c->tasks_completed = c->task_index;
+    c->chunks++;
     c->num_partials = 0;
 }
 
@@ -398,12 +447,14 @@ int solveTasksGpuMetal(int board_minus,
             if (!needs_expansion) chunk = task_count;
         }
 
+        double t_begin = nowSeconds();
+        time(&c->start_time);
+        c->last_progress = c->start_time;
+
         if (!setupMetal(c, chunk)) {
             return 0;
         }
-
-        time(&c->start_time);
-        c->last_progress = c->start_time;
+        double t_setup = nowSeconds();
 
         /*
          * Narrowing the 64-bit task fields to 32 bits is exact: col, neg_diag
@@ -423,6 +474,21 @@ int solveTasksGpuMetal(int board_minus,
         if (!c->failed) {
             *total_out = (SOLUTIONTYPE)c->total;   /* raw leaf sum; Nqueen() doubles it */
             handled = 1;
+        }
+
+        if (envFlag("NQ_GPU_TIMING")) {
+            double t_end = nowSeconds();
+            fprintf(stderr,
+                    "GPU timing (ms): setup=%.3f gpu=%.3f cpu_expand+collect=%.3f device=\"%s\" "
+                    "tasks=%d start_row=%d rows_per_thread=%d gpu_threads=%lld chunks=%lld "
+                    "command_buffers=%lld batch=%lld dispatches_per_cb=%d retries=%d%s\n",
+                    (t_setup - t_begin) * 1e3, c->gpu_seconds * 1e3,
+                    (t_end - t_setup - c->gpu_seconds) * 1e3,
+                    [[c->device name] UTF8String], task_count, c->target_depth,
+                    board_size - c->target_depth, (long long)c->partials_done,
+                    (long long)c->chunks, (long long)c->command_buffers,
+                    (long long)c->batch_size, c->dispatches_per_cb, c->retries,
+                    c->failed ? " FAILED" : "");
         }
     }
 

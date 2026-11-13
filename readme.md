@@ -1,14 +1,75 @@
-Compile with cc -O3 -Wall -Wextra -pthread nq.c -o nq
+# nq — N-Queens solution counter
 
-For machine-specific, and less portable:
-cc -O3 -march=native  -Wall -Wextra -pthread nq.c -o nq
+Counts the solutions to the N-Queens problem for an N x N board: `./nq <N>`.
 
-CUDA build (M2 path, requires CUDA toolkit + GPU):
-nvcc -O3 -DUSE_CUDA=1 nq.c nq_cuda.cu -Xcompiler "-pthread -Wall -Wextra" -o nq
+## Building
 
-Runtime mode selection with CUDA build:
-- default / auto: tries GPU, falls back to CPU
-- auto-mode GPU threshold (default 600000 tasks): `NQ_GPU_MIN_TASKS=8192 ./nq 16`
+One source tree, three builds. Each writes `./nq`.
+
+| Build | Command | Platform | Needs |
+|-------|---------|----------|-------|
+| CPU only | `make cpu` | anything with a C compiler and pthreads | — |
+| CUDA GPU | `make cuda` | Linux / NVIDIA | CUDA toolkit (`nvcc`) |
+| Metal GPU | `make metal` | macOS / Apple Silicon | full Xcode (for the `metal` shader compiler) |
+
+The CUDA and Metal backends cannot be combined in one binary.
+
+The underlying commands, if you would rather not use `make`:
+
+    cc -O3 -Wall -Wextra -pthread nq.c -o nq
+    cc -O3 -march=native -Wall -Wextra -pthread nq.c -o nq     # machine-specific, less portable
+    nvcc -O3 -DUSE_CUDA=1 nq.c nq_cuda.cu -Xcompiler "-pthread -Wall -Wextra" -o nq
+
+`make metal` also writes `nq_metal.metallib`, the compiled GPU kernel. It must stay
+in the same directory as `nq`, or be named with `NQ_METALLIB=<path>`.
+
+## Choosing CPU or GPU at run time (both GPU builds)
+
+- default / auto: uses the GPU when the problem is big enough, otherwise the CPU.
+  The GPU is used from N=17 on the CUDA build and from N=15 on the Metal build.
+- force CPU: `NQ_SOLVER_MODE=cpu ./nq 16`
+- force GPU attempt: `NQ_SOLVER_MODE=gpu ./nq 16`
+- auto-mode threshold in frontier tasks (default 600000 for CUDA, 200000 for Metal):
+  `NQ_GPU_MIN_TASKS=8192 ./nq 16`
+- one-line timing summary on stderr: `NQ_GPU_TIMING=1 ./nq 18`
+- frontier depth (default 6): `NQ_FRONTIER_DEPTH=<depth> ./nq <N>`
+
+## Metal build
+
+    make metal
+    make test-metal      # 71 correctness cases, about a minute
+    ./nq 20
+
+Results on an Apple M1 Max (more in `METAL_RESULTS.md`, design in
+`METAL_INTEGRATION_PLAN.md`):
+
+| N  | Solutions         | Time      |
+|----|-------------------|-----------|
+| 18 | 666,090,624       | 2.4 s     |
+| 20 | 39,029,188,884    | 2m 38s    |
+| 21 | 314,666,222,712   | 24m 01s   |
+| 22 | 2,691,008,701,644 | 3h 55m    |
+
+Runs longer than a minute print a progress line on stderr every 60 seconds.
+
+Tuning knobs. The defaults were measured on an M1 Max; other Apple GPUs may
+tolerate more or need less:
+
+- `NQ_METAL_MAX_ROWS` (default 13): most rows one GPU thread may solve. The CPU
+  expands the frontier deeper to keep threads under this, so long-running threads
+  do not trip the GPU watchdog.
+- `NQ_METAL_BATCH` (default 65536): GPU threads per dispatch.
+- `NQ_METAL_DISPATCHES_PER_CB` (default 16): dispatches per command buffer.
+- `NQ_METAL_CHUNK` (default 8000000): partial boards buffered before each GPU
+  flush; 24 bytes of memory each.
+
+If the GPU reports an error, the failed work is retried once. If it fails again,
+board sizes of 20 and up stop with an error rather than silently restarting on the
+CPU, which would take hours to days; smaller boards fall back to the CPU.
+
+## CUDA build
+
+Run-time options specific to the CUDA build:
 - GPU batch size (default 500000 tasks): `NQ_GPU_BATCH_TASKS=200000 ./nq 18`
 - persistent-kernel block override (optional): `NQ_GPU_PERSIST_BLOCKS=256 ./nq 19`
 - auto persist tuning target (tasks per block, default 8192): `NQ_GPU_TARGET_TASKS_PER_BLOCK=8192 ./nq 19`
@@ -16,17 +77,11 @@ Runtime mode selection with CUDA build:
 - auto-tune sample tasks (default 8192; use larger values like 65536+ on larger GPUs): `NQ_GPU_AUTOTUNE_SAMPLE_TASKS=16384 ./nq 19`
 - GPU pipeline slots for overlapped batch execution (default 2, max 2): `NQ_GPU_PIPELINE_SLOTS=1 ./nq 19`
 - GPU task bucketing (default off, opt-in): `NQ_GPU_BUCKET_TASKS=1 ./nq 19`
-- force CPU: `NQ_SOLVER_MODE=cpu ./nq 16`
-- force GPU attempt: `NQ_SOLVER_MODE=gpu ./nq 16`
-- enable GPU timing metrics: `NQ_GPU_TIMING=1 ./nq 16`
-
-Frontier depth tuning:
-- `NQ_FRONTIER_DEPTH=<depth> ./nq <N>`
 
 Mode benchmark harness (CPU vs GPU vs auto, CSV output):
 - `./bench_modes.sh --ns "16 17 18 19 20" --repeats 3 --gpu-batch 500000 --frontier-depth 6`
 
-./bench_modes.sh --ns "16 17 18 19 20" --repeats 3 --gpu-batch 500000 --frontier-depth 6
+## CUDA working notes
 
 M4
 nvcc -O3 -DUSE_CUDA=1 nq.c nq_cuda.cu -Xcompiler "-pthread -Wall -Wextra" -o nq

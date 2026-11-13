@@ -7,7 +7,7 @@
 Linux/NVIDIA (`-DUSE_CUDA`), or a Metal binary on macOS/Apple Silicon (`-DUSE_METAL`).
 CUDA and Metal are mutually exclusive (enforced with `#error` if both are defined).
 
-Status: **Phases 0 and 1 implemented on branch `metal-backend`; Phase 2 partly done (see below)** · Last updated 2026-11-11
+Status: **Phases 0–3 complete on branch `metal-backend`; ready to merge to `main`** · Last updated 2026-11-13
 
 Implementation notes (2026-11-11, M1 Max):
 - The history import was done as a plain `git merge --allow-unrelated-histories`
@@ -45,7 +45,30 @@ Implementation notes (2026-11-11, M1 Max):
   - Consequence: transient command-buffer failures happen at the validated settings,
     so the retry is load-bearing, not a safety net. The cause of the transient
     errors is unknown.
-- Still to do in Phase 2: real CUDA build on the NVIDIA box.
+  - CUDA build on the RTX 4060 box (`gabriel`, 2026-11-13): compiles without
+    warnings; N=16..19 correct on auto, N=18/19 correct forced-CPU; N=19 auto in 28 s
+    (M6 report: 26.7 s). With `NQ_GPU_BUCKET_TASKS=1`, N=19 is correct in 32 s
+    (kernel 31.1 s): bucketing is slower than the default, consistent with it being
+    opt-in.
+- **Phase 2 is complete.**
+- Phase 3 (2026-11-13):
+  - Auto-mode threshold: measured CPU vs Metal wall time for N = 8..18. Metal has
+    about 15 ms of fixed setup, loses at N ≤ 14 (0.041 s vs 0.023 s at N=14) and wins
+    from N=15 (0.052 s vs 0.108 s; 9.5x at N=17). `NQ_GPU_MIN_TASKS` now defaults to
+    200,000 on the Metal build (N=15 has 231,519 tasks), 600,000 on CUDA as before.
+  - Progress percentage now tracks GPU work completed instead of tasks expanded; a
+    header line names the device and depth before the first progress line.
+  - `NQ_GPU_TIMING=1` prints a one-line summary for Metal. At N=20: setup 16 ms, GPU
+    156.6 s, CPU expansion + result collection 0.14 s. CPU expansion is under 0.1% of
+    the run, so the "overlap expansion with the in-flight command buffer" idea in
+    the later list would gain nothing and has been dropped.
+  - `readme.md` restructured around a build matrix with a Metal section;
+    `METAL_RESULTS.md` has the integrated-build timings.
+  - nq_metal has a README marking it retired and pointing here.
+- Remaining before merge: push the branch (blocked on GitHub credentials for this
+  machine), then merge to `main`.
+- Known open question: the cause of the transient Internal Error 0000000e command
+  buffer failures. They are handled, not understood.
 - The built `./nq` binary is no longer tracked; `NQ_METAL_CHUNK` was added as a
   fourth tuning knob, mainly for tests.
 
@@ -282,9 +305,9 @@ All counters 64-bit. Exit criterion: `NQ_SOLVER_MODE=gpu ./nq N` correct for N =
 
 **Later, only if wanted.**
 - Embed the metallib (`-sectcreate` + `newLibraryWithData:`) for a single-file binary.
-- Overlap CPU expansion of the next chunk with the in-flight command buffer (does not
-  violate invariant 1 — it is CPU work, not a second queued CB).
 - Resume file keyed on shallow-task index + running total, for multi-day N ≥ 23 runs.
+- Re-measure the 13-row cap (`NQ_METAL_MAX_ROWS=14`) at N=21/22; it did not crash at
+  N=20, and if it holds it lowers CPU expansion and thread count.
 
 ---
 

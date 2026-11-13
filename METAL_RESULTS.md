@@ -2,6 +2,24 @@
 
 Hardware: Apple M1 Max, 32 GB unified memory
 
+## Integrated backend (`make metal` in this repo, November 2026)
+
+Same kernel and settings as the standalone "Current" table below; the frontier comes
+from `nq.c` and is expanded to row K inside `nq_metal.m`.
+
+| N  | Solutions             | K  | Time       | vs standalone |
+|----|-----------------------|----|------------|---------------|
+| 18 | 666,090,624           | 6  | 2.4s       | —             |
+| 20 | 39,029,188,884        | 7  | 2m 38s     | +0.6%         |
+| 21 | 314,666,222,712       | 8  | 24m 01s    | +1.1%         |
+| 22 | 2,691,008,701,644     | 9  | 3h 55m     | +2.3%         |
+
+The N=22 run hit two transient command-buffer failures (Internal Error 0000000e)
+about six minutes in; both were retried successfully. The standalone solver exits on
+that error.
+
+The tables below are from the standalone `nq_metal` repository, before integration.
+
 ## Current (4-row leaf peeling, no checkpointing, K=N-13)
 
 | N  | Solutions             | K  | Time       | vs Original |
