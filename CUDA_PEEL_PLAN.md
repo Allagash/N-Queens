@@ -1,11 +1,19 @@
 # Can the NVIDIA (RTX 4060) build be made meaningfully faster?
 
-Status: **Done except for a final confirmation run.** `peel` is now the default
-CUDA kernel; the automatic block count has not been built by `nvcc` yet · 2026-11-13
+Status: **Done and confirmed on the RTX 4060.** `peel` is the default CUDA kernel
+with an automatic block count · 2026-11-13
 
-Outcome on the RTX 4060 (kernel+reduce, all counts correct): **N=19 31.0 s → 12.5 s
-(2.5x), N=20 244 s → 107 s (2.3x)**, inside the 2–4x estimate below but not for the
-reason given there.
+Final result at default settings (kernel+reduce, same session, all counts correct
+for N = 8..20):
+
+| N  | legacy (62 blocks) | peel (auto blocks)  | speedup |
+|----|--------------------|---------------------|---------|
+| 18 | 4.94 s             | 1.48 s (312 blocks) | 3.3x    |
+| 19 | 30.8 s             | 12.0 s (264 blocks) | 2.6x    |
+| 20 | 245.9 s            | 103.2 s (240 blocks)| 2.4x    |
+
+That is inside the 2–4x estimate below, but not for the reason given there. The
+tuning sweep that led here:
 
 | Setting                         | N=18   | N=19   | N=20   |
 |---------------------------------|--------|--------|--------|
